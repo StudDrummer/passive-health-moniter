@@ -22,9 +22,9 @@ from typing import Optional
 
 import yaml
 
-from core.ingestion import FrameIngestion
-from core.pose_estimator import PoseEstimator
-from core.types import PoseFrame
+from ingestion import FrameIngestion
+from pose_estimator import PoseEstimator
+from data_types import PoseFrame
 
 logger = logging.getLogger(__name__)
 
