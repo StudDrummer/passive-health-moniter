@@ -1,0 +1,53 @@
+# Vigil Camera Pipeline Configuration
+# Tested on: NVIDIA Jetson Orin Nano
+
+camera:
+  source: 0
+  use_gstreamer: true
+  width: 1280
+  height: 720
+  fps: 30
+  gstreamer_pipeline: >
+    nvarguscamerasrc sensor-id=0 !
+    video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1, format=NV12 !
+    nvvidconv flip-method=0 !
+    video/x-raw, format=BGRx !
+    videoconvert !
+    video/x-raw, format=BGR !
+    appsink drop=1
+
+pose:
+  model: "yolov8n-pose.pt"       # nano = fastest on edge. swap to yolov8s-pose.pt for more accuracy
+  device: "cuda"                  # "cuda" for Jetson GPU, "cpu" fallback
+  confidence_threshold: 0.5       # minimum detection confidence
+  iou_threshold: 0.7
+  target_person_id: 0             # 0 = track primary resident (closest/largest)
+  keypoint_confidence_min: 0.3    # discard keypoints below this visibility score
+
+inference:
+  # Run pose every N frames to save compute (interpolate between)
+  inference_every_n_frames: 2
+  input_size: 640                 # YOLOv8 input resolution (square)
+  half_precision: true            # FP16 on Jetson GPU — significant speedup
+
+privacy:
+  # CRITICAL: raw frames are NEVER written to disk or network
+  store_raw_frames: false
+  store_keypoints_only: true
+  blur_face_in_debug: true        # if debug visualization is enabled
+
+output:
+  # Keypoint data written to local SQLite for downstream modules
+  db_path: "./data/vigil.db"
+  # Emit live keypoint stream over local socket for other modules
+  socket_enabled: true
+  socket_port: 5557
+  # Debug window — disable in production
+  show_debug_window: false
+  debug_draw_skeleton: true
+  debug_draw_bbox: true
+
+logging:
+  level: "INFO"                   # DEBUG / INFO / WARNING / ERROR
+  log_to_file: true
+  log_path: "./logs/pipeline.log"

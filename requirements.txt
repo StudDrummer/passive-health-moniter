@@ -1,0 +1,69 @@
+# VIGIL Camera Pipeline — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core ML
+ultralytics>=8.2.0          # YOLOv8-Pose + ByteTrack built in
+numpy>=1.24.0
+opencv-python>=4.8.0        # Use opencv-python-headless on Jetson headless installs
+
+# Config
+pyyaml>=6.0
+
+# Storage (Phase 2 — baseline engine)
+# sqlite3 is stdlib, no install needed
+
+# Networking (Phase 3 — app sync)
+# zmq for local socket streaming (optional)
+# pyzmq>=25.0
+
+# ──────────────────────────────────────────────────────────────────
+# JETSON ORIN NANO SPECIFIC SETUP NOTES
+# ──────────────────────────────────────────────────────────────────
+#
+# 1. Flash JetPack 6.x (includes CUDA 12.x, cuDNN, TensorRT)
+#    https://developer.nvidia.com/embedded/jetpack
+#
+# 2. Install system dependencies:
+#    sudo apt update
+#    sudo apt install -y python3-pip python3-dev
+#    sudo apt install -y libopencv-dev python3-opencv
+#    sudo apt install -y libcamera-dev  # for CSI camera
+#
+# 3. Install PyTorch for Jetson (NOT the standard pip torch):
+#    # Check your JetPack version first: jetson_release
+#    # Get the correct wheel from: https://forums.developer.nvidia.com/t/pytorch-for-jetson/72048
+#    # Example for JetPack 6.x:
+#    pip install --no-cache https://developer.download.nvidia.com/compute/redist/jp/v60/pytorch/torch-2.3.0+nv24.5-cp310-cp310-linux_aarch64.whl
+#
+# 4. Install ultralytics AFTER torch:
+#    pip install ultralytics
+#
+# 5. Verify CUDA is working:
+#    python3 -c "import torch; print(torch.cuda.is_available())"
+#    # Should print: True
+#
+# 6. Model download (first run will auto-download, or pre-download):
+#    python3 -c "from ultralytics import YOLO; YOLO('yolov8n-pose.pt')"
+#
+# 7. Run the pipeline:
+#    python3 core/pipeline.py --source test --debug  # test with no camera
+#    python3 core/pipeline.py --source 0 --debug     # USB camera
+#    python3 core/pipeline.py                        # production CSI camera
+#
+# ──────────────────────────────────────────────────────────────────
+# MODEL SELECTION GUIDE
+# ──────────────────────────────────────────────────────────────────
+#
+# yolov8n-pose.pt  — Nano   — ~6MB   — fastest, ~25-30fps on Orin Nano GPU
+# yolov8s-pose.pt  — Small  — ~23MB  — balanced, ~15-20fps
+# yolov8m-pose.pt  — Medium — ~52MB  — high accuracy, ~8-12fps
+#
+# For production on Orin Nano: start with nano, upgrade to small if
+# keypoint accuracy is insufficient for gait measurement.
+#
+# TensorRT export for maximum Jetson performance (Phase 2):
+#   from ultralytics import YOLO
+#   model = YOLO('yolov8n-pose.pt')
+#   model.export(format='engine', device=0, half=True)
+#   # Then use: YOLO('yolov8n-pose.engine')
+# ──────────────────────────────────────────────────────────────────
