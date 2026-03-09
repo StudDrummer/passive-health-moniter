@@ -18,8 +18,8 @@ import numpy as np
 from typing import Optional
 from collections import deque
 
-from core.types import PoseFrame, Keypoint, KP, PipelineStats
-from core.ingestion import CapturedFrame
+from data_types import PoseFrame, Keypoint, KP, PipelineStats
+from ingestion import CapturedFrame
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +314,7 @@ class PoseEstimator:
         NEVER called in production — exists only for development.
         """
         import cv2
-        from core.types import SKELETON_EDGES
+        from data_types import SKELETON_EDGES
 
         if pose is None:
             cv2.putText(bgr, "NO DETECTION", (20, 50),

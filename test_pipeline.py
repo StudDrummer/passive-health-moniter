@@ -14,8 +14,8 @@ import time
 import numpy as np
 import pytest
 
-from core.types import Keypoint, PoseFrame, KP, SKELETON_EDGES
-from core.ingestion import FrameIngestion, CapturedFrame, _TestCapture
+from data_types import Keypoint, PoseFrame, KP, SKELETON_EDGES
+from ingestion import FrameIngestion, CapturedFrame, _TestCapture
 
 
 # ──────────────────────────────────────────
