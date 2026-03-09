@@ -9,3 +9,6 @@ pipeline = (
 cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
 ret, frame = cap.read()
 print("Success:", ret, frame.shape if ret else "no frame")
+
+
+
