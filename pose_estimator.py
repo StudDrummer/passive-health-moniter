@@ -314,7 +314,7 @@ class PoseEstimator:
         NEVER called in production — exists only for development.
         """
         import cv2
-        from data_types import SKELETON_EDGES
+        from core.types import SKELETON_EDGES
 
         if pose is None:
             cv2.putText(bgr, "NO DETECTION", (20, 50),
