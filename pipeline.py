@@ -1,14 +1,10 @@
 """
-vigil/core/pipeline.py
+vigil/pipeline.py  (flat structure — all files in same directory)
 
 Main pipeline orchestrator.
-Ties frame ingestion → pose estimation → signal modules together.
-This is the entry point for the camera process.
-
 Run with:
-    python pipeline.py
-    python pipeline.py --config config/camera_config.yaml
-    python pipeline.py --source test    # no hardware needed
+    python3 pipeline.py --config camera_config.yaml --debug
+    python3 pipeline.py --config camera_config.yaml --source test
 """
 
 import cv2
@@ -25,6 +21,7 @@ import yaml
 from ingestion import FrameIngestion
 from pose_estimator import PoseEstimator
 from data_types import PoseFrame
+from gait import GaitModule
 
 logger = logging.getLogger(__name__)
 
@@ -51,57 +48,40 @@ def setup_logging(config: dict):
 
 
 class VIGILPipeline:
-    """
-    Top-level pipeline. Wires all components together.
-
-    Extend this class to add signal modules:
-        def _on_pose(self, pose: PoseFrame):
-            self.gait_module.update(pose)
-            self.posture_module.update(pose)
-            self.emergency_module.update(pose)
-    """
 
     def __init__(self, config: dict):
         self.config = config
         self._running = False
 
-        # Components
         self.ingestion = FrameIngestion(config)
         self.pose = PoseEstimator(config)
 
-        # Signal modules will attach here in future phases
-        self._signal_modules = []
+        # Signal modules
+        self.gait = GaitModule()
+        self._signal_modules = [self.gait]
 
-        # Stats
         self._frame_count = 0
         self._pose_count = 0
         self._start_time = 0.0
 
-        # Handle Ctrl+C gracefully
         signal.signal(signal.SIGINT, self._handle_shutdown)
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
     def add_module(self, module):
-        """Register a signal module to receive pose frames."""
         self._signal_modules.append(module)
         logger.info(f"Module registered: {module.__class__.__name__}")
 
     def run(self):
-        """Start the pipeline. Blocks until stopped."""
         logger.info("=" * 60)
         logger.info("VIGIL Camera Pipeline starting")
         logger.info("=" * 60)
 
-        # Load model
         self.pose.load()
-
-        # Open camera and start capture thread
         self.ingestion.start()
         self._running = True
         self._start_time = time.monotonic()
 
         show_debug = self.config["output"].get("show_debug_window", False)
-
         logger.info("Pipeline running. Press Ctrl+C to stop.")
 
         try:
@@ -109,7 +89,6 @@ class VIGILPipeline:
                 if not self._running:
                     break
 
-                # Pose estimation
                 pose_frame = self.pose.process(raw_frame)
                 self._frame_count += 1
 
@@ -117,41 +96,61 @@ class VIGILPipeline:
                     self._pose_count += 1
                     self._on_pose(pose_frame)
 
-                # Debug window
                 if show_debug:
                     display = raw_frame.bgr.copy()
                     display = self.pose.draw_debug(display, pose_frame)
+                    self._draw_gait_overlay(display)
                     self._draw_pipeline_stats(display)
                     cv2.imshow("VIGIL Debug", display)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
 
-                # Log stats every 5s
-                if self._frame_count % (30 * 5) == 0:
+                if self._frame_count % 150 == 0:
                     self._log_stats()
 
         finally:
             self._shutdown()
 
     def _on_pose(self, pose: PoseFrame):
-        """
-        Called for every valid pose frame.
-        Dispatches to all registered signal modules.
-        Phase 2 will add: gait, posture, emergency, face modules here.
-        """
         for module in self._signal_modules:
             try:
                 module.update(pose)
             except Exception as e:
                 logger.error(f"Module {module.__class__.__name__} error: {e}", exc_info=True)
 
-        # For now — log keypoint summary at DEBUG level
-        logger.debug(
-            f"Frame {pose.frame_index:06d} | "
-            f"track={pose.track_id} | "
-            f"visible_kps={pose.visible_keypoint_count()} | "
-            f"conf={pose.detection_confidence:.2f}"
-        )
+    def _draw_gait_overlay(self, bgr):
+        """Draw live gait metrics on the debug window."""
+        m = self.gait.latest_metrics
+        if m is None:
+            cv2.putText(bgr, "GAIT: calibrating...", (10, bgr.shape[0] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 150, 150), 1)
+            return
+
+        lines = [
+            f"Speed:   {m.speed_px_per_sec:.1f} px/s",
+            f"Stride:  {m.stride_length_px:.1f} px",
+            f"Cadence: {m.cadence_spm:.1f} spm",
+            f"Asym:    {m.asymmetry_pct:.1f}%",
+            f"Conf:    {m.confidence:.2f}",
+        ]
+
+        # Background panel
+        panel_x, panel_y = 10, bgr.shape[0] - 160
+        cv2.rectangle(bgr, (panel_x - 5, panel_y - 15),
+                      (panel_x + 200, panel_y + len(lines) * 22 + 5),
+                      (0, 0, 0), -1)
+
+        for i, line in enumerate(lines):
+            # Flag slow gait in red
+            color = (0, 80, 255) if (i == 0 and m.slow_gait) else (0, 220, 140)
+            cv2.putText(bgr, line, (panel_x, panel_y + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 1)
+
+        # Baseline status
+        bl_text = "Baseline: LOCKED" if self.gait.baseline_locked else f"Baseline: learning ({self.gait.stride_count} strides)"
+        cv2.putText(bgr, bl_text, (10, bgr.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (0, 220, 140) if self.gait.baseline_locked else (0, 180, 255), 1)
 
     def _shutdown(self):
         logger.info("Shutting down pipeline...")
@@ -159,6 +158,9 @@ class VIGILPipeline:
         self.ingestion.stop()
         cv2.destroyAllWindows()
         self._log_stats(final=True)
+
+        if self.gait.baseline_locked:
+            logger.info(f"Final baseline: {self.gait.baseline}")
 
     def _handle_shutdown(self, *_):
         logger.info("Shutdown signal received.")
@@ -170,30 +172,24 @@ class VIGILPipeline:
         detection_rate = self._pose_count / self._frame_count if self._frame_count > 0 else 0
         prefix = "FINAL" if final else "STATS"
         logger.info(
-            f"[{prefix}] "
-            f"frames={self._frame_count} | "
-            f"fps={fps:.1f} | "
+            f"[{prefix}] frames={self._frame_count} | fps={fps:.1f} | "
             f"detection_rate={detection_rate:.1%} | "
-            f"avg_infer={self.pose.stats.avg_inference_ms:.1f}ms | "
-            f"uptime={elapsed:.0f}s"
+            f"infer={self.pose.stats.avg_inference_ms:.1f}ms | "
+            f"strides={self.gait.stride_count}"
         )
 
     def _draw_pipeline_stats(self, bgr):
-        import numpy as np
         elapsed = time.monotonic() - self._start_time
         fps = self._frame_count / elapsed if elapsed > 0 else 0
-        cv2.putText(bgr, f"Pipeline FPS: {fps:.1f}", (bgr.shape[1] - 200, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 150, 150), 1)
+        cv2.putText(bgr, f"FPS: {fps:.1f} | Infer: {self.pose.stats.avg_inference_ms:.0f}ms",
+                    (bgr.shape[1] - 240, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (150, 150, 150), 1)
 
-
-# ──────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="VIGIL Camera Pipeline")
-    parser.add_argument("--config", default="config/camera_config.yaml")
-    parser.add_argument("--source", help="Override camera source (e.g. 'test', '0', 'rtsp://...')")
+    parser.add_argument("--config", default="camera_config.yaml")
+    parser.add_argument("--source", help="Override camera source ('test', '0', 'rtsp://...')")
     parser.add_argument("--debug", action="store_true", help="Enable debug window")
     parser.add_argument("--no-gpu", action="store_true", help="Force CPU inference")
     args = parser.parse_args()
@@ -201,7 +197,6 @@ def main():
     config = load_config(args.config)
     setup_logging(config)
 
-    # CLI overrides
     if args.source:
         config["camera"]["source"] = int(args.source) if args.source.isdigit() else args.source
     if args.debug:
