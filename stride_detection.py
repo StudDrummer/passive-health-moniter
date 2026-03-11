@@ -2,16 +2,20 @@ import sys, cv2
 sys.path.insert(0, '.')
 from ultralytics import YOLO
 
-VIDEO_PATH = 'Users/rushilmohan/downloads/stride_detection.mp4'
-cap = cv2.VideoCapture(VIDEO_PATH)
-model = YOLO('yolov8n-pose.pt')
-frame_num=0
+cap = cv2.VideoCapture('stride_detection.mp4')
+print('Video opened:', cap.isOpened())
+print('Total frames:', int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+print('FPS:', cap.get(cv2.CAP_PROP_FPS))
+print('Resolution:', int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), 'x', int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
-while frame_num <150:
+model = YOLO('yolov8n-pose.pt')
+frame_num = 0
+
+while frame_num < 150:
     ret, frame = cap.read()
     if not ret: break
     frame_num += 1
-    if frame_num % 3 != 0: continue  # sample every 3rd frame
+    if frame_num % 3 != 0: continue
     results = model.predict(frame, verbose=False, conf=0.3)
     if results and results[0].keypoints is not None and len(results[0].keypoints) > 0:
         kps = results[0].keypoints.data[0].cpu().numpy()
