@@ -77,7 +77,6 @@ class PoseEstimator:
         except ImportError:
             raise ImportError(
                 "ultralytics not installed.\n"
-                "Run: pip install ultralytics"
             )
 
         model_path = self.pose_cfg["model"]
