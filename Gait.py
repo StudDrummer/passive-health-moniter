@@ -1,4 +1,3 @@
-
 """
 vigil/gait.py
 
