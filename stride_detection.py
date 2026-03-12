@@ -31,7 +31,7 @@
 
 
 # real code for stride detection
- """
+"""
 stride_detection.py
 
 Standalone gait analysis on a video file.
