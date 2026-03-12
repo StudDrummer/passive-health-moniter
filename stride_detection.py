@@ -83,7 +83,7 @@ class StandaloneGait:
     MIN_CONF = 0.15
     SMOOTHING_WIN = 9
     MIN_VELOCITY = 25.0        # px/sec — minimum swing velocity
-    COOLDOWN = 0.3             # sec between strides
+    COOLDOWN = 0.35            # sec between strides (slightly longer to reduce duplicates)
 
     def __init__(self):
         self._left  = deque(maxlen=150)   # (time, x, y)
@@ -94,6 +94,11 @@ class StandaloneGait:
         self._strides = []
         self._last_left  = None
         self._last_right = None
+
+        # Track the latest timestamp we've already emitted per foot
+        # This prevents re-detecting old peaks from the history buffer
+        self._last_emitted_left  = -1.0
+        self._last_emitted_right = -1.0
 
         self._cam_mode = "unknown"
         self._y_ranges = deque(maxlen=40)
@@ -141,15 +146,17 @@ class StandaloneGait:
 
         # Detect strides
         new_strides = []
-        new_strides += self._process_foot("left",  self._left,  self._last_left,  timestamp, body_scale)
-        new_strides += self._process_foot("right", self._right, self._last_right, timestamp, body_scale)
+        new_strides += self._process_foot("left",  self._left,  self._last_left,  timestamp, body_scale, self._last_emitted_left)
+        new_strides += self._process_foot("right", self._right, self._last_right, timestamp, body_scale, self._last_emitted_right)
 
         for s in new_strides:
             self._strides.append(s)
             if s["foot"] == "left":
                 self._last_left = s
+                self._last_emitted_left = s["time"]
             else:
                 self._last_right = s
+                self._last_emitted_right = s["time"]
 
         return new_strides if new_strides else None
 
@@ -170,7 +177,7 @@ class StandaloneGait:
         else:
             self._cam_mode = "angled"
 
-    def _process_foot(self, foot, history, last, now, body_scale):
+    def _process_foot(self, foot, history, last, now, body_scale, last_emitted_time):
         if len(history) < self.SMOOTHING_WIN + 4:
             return []
 
@@ -215,7 +222,7 @@ class StandaloneGait:
             signal,
             height=self.MIN_VELOCITY,
             distance=min_dist,
-            prominence=8.0,
+            prominence=12.0,   # raised from 8 to cut noise peaks
         )
 
         results = []
@@ -229,24 +236,27 @@ class StandaloneGait:
             strike_x = xs_s[min(strike_idx, len(xs_s)-1)]
             strike_y = ys_s[min(strike_idx, len(ys_s)-1)]
 
-            if last and (strike_time - last["time"]) < self.COOLDOWN:
+            # KEY FIX: skip any peak we've already emitted
+            if strike_time <= last_emitted_time + self.COOLDOWN:
                 continue
-            if (now - strike_time) > 2.0:
-                continue
-            if self._strides and abs(self._strides[-1]["time"] - strike_time) < self.COOLDOWN:
+            if (now - strike_time) > 1.5:
                 continue
 
             stride_px = stride_norm = stride_dur = 0.0
             if last:
                 dx = strike_x - last["x"]
                 dy = strike_y - last["y"]
-                stride_px  = float(np.sqrt(dx**2 + dy**2))
+                stride_px   = float(np.sqrt(dx**2 + dy**2))
                 stride_norm = stride_px / body_scale if body_scale > 0 else 0
                 stride_dur  = strike_time - last["time"]
-                if stride_dur < 0.25 or stride_dur > 4.0:
+                if stride_dur < 0.25 or stride_dur > 3.0:
                     continue
-                if stride_px < body_scale * 0.05:
+                # Require at least 15% of body scale — filters out noise micro-strides
+                if stride_px < body_scale * 0.15:
                     continue
+            else:
+                # First stride for this foot — no length check, just record position
+                pass
 
             event = {
                 "foot":       foot,
