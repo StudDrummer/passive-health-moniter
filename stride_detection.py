@@ -31,7 +31,7 @@
 
 
 # real code for stride detection
-"""
+ """
 stride_detection.py
 
 Standalone gait analysis on a video file.
@@ -222,10 +222,12 @@ class StandaloneGait:
             signal,
             height=self.MIN_VELOCITY,
             distance=min_dist,
-            prominence=12.0,   # raised from 8 to cut noise peaks
+            prominence=12.0,
         )
 
         results = []
+        emitted_this_call = last_emitted_time  # track within this call too
+
         for peak_idx in peaks:
             post = signal[peak_idx:]
             troughs = np.where(post < self.MIN_VELOCITY * 0.3)[0]
@@ -236,10 +238,14 @@ class StandaloneGait:
             strike_x = xs_s[min(strike_idx, len(xs_s)-1)]
             strike_y = ys_s[min(strike_idx, len(ys_s)-1)]
 
-            # KEY FIX: skip any peak we've already emitted
-            if strike_time <= last_emitted_time + self.COOLDOWN:
+            # Must be strictly newer than last emission + cooldown
+            if strike_time <= emitted_this_call + self.COOLDOWN:
                 continue
-            if (now - strike_time) > 1.5:
+            # Must be recent — don't process old history
+            if (now - strike_time) > 0.8:
+                continue
+            # Must be close to the current frame (within 2 * cooldown window)
+            if strike_time < now - self.COOLDOWN * 2:
                 continue
 
             stride_px = stride_norm = stride_dur = 0.0
@@ -251,12 +257,25 @@ class StandaloneGait:
                 stride_dur  = strike_time - last["time"]
                 if stride_dur < 0.25 or stride_dur > 3.0:
                     continue
-                # Require at least 15% of body scale — filters out noise micro-strides
                 if stride_px < body_scale * 0.15:
                     continue
             else:
-                # First stride for this foot — no length check, just record position
                 pass
+
+            event = {
+                "foot":        foot,
+                "time":        strike_time,
+                "x":           float(strike_x),
+                "y":           float(strike_y),
+                "stride_px":   stride_px,
+                "stride_norm": stride_norm,
+                "stride_dur":  stride_dur,
+                "peak_vel":    float(signal[peak_idx]),
+                "body_scale":  body_scale,
+                "cam_mode":    self._cam_mode,
+            }
+            results.append(event)
+            emitted_this_call = strike_time  # block any further peaks in this call
 
             event = {
                 "foot":       foot,
@@ -462,7 +481,7 @@ def main():
                 #main text
                 cv2.putText(display, line, pos,
                           cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
-                  
+
             # Flash green on new stride
             if new_strides:
                 cv2.rectangle(display, (0, 0), (display.shape[1], display.shape[0]), (0, 255, 0), 6)
@@ -534,3 +553,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
