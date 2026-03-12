@@ -455,9 +455,14 @@ def main():
                 hud.append(f"Last stride: {last['foot']} | {last['stride_norm']:.2f}x | {last['stride_dur']:.2f}s")
 
             for i, line in enumerate(hud):
-                cv2.putText(display, line, (10, 25 + i * 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-
+                pos = (10, 25 + i * 22)
+                #outline
+                cv2.putText(display, line, pos,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 3)
+                #main text
+                cv2.putText(display, line, pos,
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
+                  
             # Flash green on new stride
             if new_strides:
                 cv2.rectangle(display, (0, 0), (display.shape[1], display.shape[0]), (0, 255, 0), 6)
