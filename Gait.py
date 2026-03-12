@@ -1,27 +1,22 @@
 """
-vigil/gait.py
+vigil/gait.py  — v2
 
-Gait analysis module.
-Consumes a stream of PoseFrames and computes clinical gait metrics
-every stride cycle.
+Robust gait analysis module.
 
-Metrics computed:
-  - Gait speed       (pixels/sec → normalized to personal baseline)
-  - Stride length    (pixels → normalized)
-  - Cadence          (steps/minute)
-  - Asymmetry        (% difference left vs right stride timing)
-  - Stance width     (hip-ankle lateral distance — balance proxy)
+v1 problems solved:
+  - Single-axis Y peak detection failed for non-side-view cameras
+  - Too sensitive to noisy keypoint readings
+  - No smoothing — single bad frame broke detection
 
-All metrics are pixel-relative. Absolute real-world values require
-a depth camera or scene calibration (Phase 4). For longitudinal
-anomaly detection, pixel-relative change over time is sufficient.
-
-Usage:
-    gait = GaitModule()
-    pipeline.add_module(gait)
-
-    # Access latest metrics
-    metrics = gait.latest_metrics
+v2 approach:
+  - Camera-agnostic stride detection using ankle VELOCITY not position
+    Heel strike = ankle decelerates to near-zero after a swing phase
+    This works for side view, angled view, and front/back view
+  - Savitzky-Golay smoothing on ankle trajectories before peak detection
+  - Confidence gating — low confidence keypoints filtered, not discarded
+  - Adaptive stride threshold based on observed body scale (hip-ankle distance)
+  - Automatically detects camera orientation (side/front/angled)
+  - Step regularity metric via autocorrelation (Parkinson's/freezing marker)
 """
 
 import time
@@ -30,449 +25,402 @@ import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
+from scipy.signal import find_peaks, savgol_filter
 
 from data_types import PoseFrame, KP
 
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────
-# Output data structures
-# ─────────────────────────────────────────────
-
 @dataclass
 class StrideEvent:
-    """
-    A single detected stride (one full gait cycle for one foot).
-    Detected when the ankle reaches its lowest vertical point
-    (heel strike approximation in 2D top-down or side-view).
-    """
     timestamp: float
-    foot: str                    # "left" or "right"
-    stride_length_px: float      # pixel distance from last same-foot strike
-    stride_duration_sec: float   # time since last same-foot strike
-    ankle_x: float               # x position at strike
-    ankle_y: float               # y position at strike
+    foot: str
+    stride_length_px: float
+    stride_length_normalized: float  # stride / body_scale
+    stride_duration_sec: float
+    ankle_x: float
+    ankle_y: float
+    peak_velocity: float
 
 
 @dataclass
 class GaitMetrics:
-    """
-    Computed gait metrics over the most recent analysis window.
-    Published after every stride event.
-    """
     timestamp: float
-
-    # Core metrics
-    speed_px_per_sec: float         # pixels/sec of center-of-mass movement
-    stride_length_px: float         # avg stride length in pixels
-    cadence_spm: float              # steps per minute
-    asymmetry_pct: float            # 0-100%, higher = more asymmetric
-
-    # Balance proxy
-    stance_width_px: float          # lateral distance between ankles during stance
-
-    # Confidence — how complete the keypoint data was
-    confidence: float               # 0-1, based on keypoint visibility
-
-    # Flags
-    is_walking: bool                # True if motion detected in last 2s
-    is_shuffling: bool              # True if stride length < 40% of baseline
-    slow_gait: bool                 # True if speed < 70% of personal baseline
-
-    # Raw history for debugging
+    speed_px_per_sec: float
+    speed_normalized: float
+    stride_length_px: float
+    stride_length_normalized: float
+    cadence_spm: float
+    asymmetry_pct: float
+    stance_width_px: float
+    step_regularity: float
+    body_scale_px: float
+    camera_mode: str
+    keypoint_confidence: float
+    is_walking: bool
+    is_shuffling: bool
+    slow_gait: bool
+    high_asymmetry: bool
     recent_stride_lengths: list = field(default_factory=list)
-    recent_cadences: list = field(default_factory=list)
 
-
-# ─────────────────────────────────────────────
-# Main module
-# ─────────────────────────────────────────────
 
 class GaitModule:
     """
-    Stateful gait analyzer. Maintains rolling buffers of pose data
-    and emits GaitMetrics whenever a stride cycle completes.
-
-    Attach to pipeline:
-        gait = GaitModule()
-        pipeline.add_module(gait)
+    Camera-agnostic gait analyzer using ankle velocity profiles.
+    Automatically adapts to side, front, and angled camera placements.
     """
 
-    # Tuning constants
-    BUFFER_SECONDS = 3.0          # how much pose history to keep
-    MIN_FRAMES_FOR_ANALYSIS = 15  # need at least this many frames to compute
-    STRIDE_COOLDOWN_SEC = 0.25    # minimum time between detected strides (debounce)
-    WALKING_MOTION_THRESH = 8.0   # pixels/frame CoM movement to count as walking
-    STILLNESS_TIMEOUT = 2.0       # seconds of no motion before marking not-walking
+    HISTORY_SECONDS = 4.0
+    MIN_FRAMES = 20
+    STRIDE_COOLDOWN_SEC = 0.25
+    MIN_SWING_VELOCITY = 30.0     # px/sec minimum ankle speed to count as swing
+    SMOOTHING_WINDOW = 7
+    SMOOTHING_POLY = 2
+    BASELINE_STRIDES = 15
 
     def __init__(self, baseline: Optional[dict] = None):
-        """
-        Args:
-            baseline: Optional pre-loaded personal baseline dict with keys:
-                      'speed_px_per_sec', 'stride_length_px', 'cadence_spm'
-                      If None, baseline is learned from first ~60 seconds of data.
-        """
-        # Rolling frame buffer — stores (timestamp, keypoints_dict)
-        self._frame_buffer: deque = deque()
+        self._left_ankle:  deque = deque(maxlen=120)
+        self._right_ankle: deque = deque(maxlen=120)
+        self._com:         deque = deque(maxlen=120)
+        self._body_scale:  deque = deque(maxlen=30)
 
-        # Stride event history
-        self._strides: deque = deque(maxlen=20)
+        self._strides:     deque = deque(maxlen=30)
+        self._last_left:   Optional[StrideEvent] = None
+        self._last_right:  Optional[StrideEvent] = None
 
-        # Per-foot ankle tracking for stride detection
-        self._left_ankle_history: deque = deque(maxlen=60)
-        self._right_ankle_history: deque = deque(maxlen=60)
-        self._last_left_strike: Optional[StrideEvent] = None
-        self._last_right_strike: Optional[StrideEvent] = None
+        self._y_range_history: deque = deque(maxlen=60)
+        self._x_range_history: deque = deque(maxlen=60)
+        self._camera_mode = "unknown"
 
-        # Center of mass history for speed calculation
-        self._com_history: deque = deque(maxlen=90)  # ~3s at 30fps
-
-        # Personal baseline (learned or provided)
         self._baseline = baseline or {}
         self._baseline_samples: list = []
         self._baseline_locked = baseline is not None
-        self._baseline_lock_after_n_strides = 20
 
-        # Latest published metrics
         self.latest_metrics: Optional[GaitMetrics] = None
-
-        # State
-        self._last_motion_time = time.monotonic()
         self._frame_count = 0
 
-        logger.info("GaitModule initialized" + (" with provided baseline" if baseline else " — will learn baseline"))
+        logger.info(f"GaitModule v2 | baseline={'provided' if baseline else 'learning'}")
 
     # ─────────────────────────────────────────
-    # Pipeline interface
+    # Pipeline entry point
     # ─────────────────────────────────────────
 
     def update(self, pose: PoseFrame):
-        """
-        Called by pipeline for every valid PoseFrame.
-        This is the main entry point.
-        """
         self._frame_count += 1
+        now = pose.timestamp
 
-        # Extract the keypoints we care about
-        left_ankle  = pose.get_xy(KP.LEFT_ANKLE)
-        right_ankle = pose.get_xy(KP.RIGHT_ANKLE)
-        left_hip    = pose.get_xy(KP.LEFT_HIP)
-        right_hip   = pose.get_xy(KP.RIGHT_HIP)
-        left_knee   = pose.get_xy(KP.LEFT_KNEE)
-        right_knee  = pose.get_xy(KP.RIGHT_KNEE)
+        la = pose.get_xy(KP.LEFT_ANKLE)
+        ra = pose.get_xy(KP.RIGHT_ANKLE)
+        lh = pose.get_xy(KP.LEFT_HIP)
+        rh = pose.get_xy(KP.RIGHT_HIP)
 
-        # Center of mass approximation — midpoint of hips
+        la_conf = pose.get(KP.LEFT_ANKLE).confidence
+        ra_conf = pose.get(KP.RIGHT_ANKLE).confidence
+
+        # Body scale
+        if lh is not None and la is not None:
+            scale = float(np.linalg.norm(la - lh))
+            if scale > 20:
+                self._body_scale.append(scale)
+
+        body_scale = float(np.median(self._body_scale)) if self._body_scale else 200.0
+
+        # CoM
         com = pose.midpoint(KP.LEFT_HIP, KP.RIGHT_HIP)
-
         if com is not None:
-            self._com_history.append((pose.timestamp, com))
+            self._com.append((now, com))
 
-        # Track ankles for stride detection
-        if left_ankle is not None:
-            self._left_ankle_history.append((pose.timestamp, left_ankle))
-        if right_ankle is not None:
-            self._right_ankle_history.append((pose.timestamp, right_ankle))
+        # Ankle history — accept lower confidence than before (0.15 vs 0.3)
+        if la is not None and la_conf > 0.15:
+            self._left_ankle.append((now, la[0], la[1], la_conf))
+        if ra is not None and ra_conf > 0.15:
+            self._right_ankle.append((now, ra[0], ra[1], ra_conf))
 
-        # Prune old frames from buffer
-        cutoff = pose.timestamp - self.BUFFER_SECONDS
-        while self._frame_buffer and self._frame_buffer[0][0] < cutoff:
-            self._frame_buffer.popleft()
-        self._frame_buffer.append((pose.timestamp, pose))
-
-        # Need enough history before computing
-        if self._frame_count < self.MIN_FRAMES_FOR_ANALYSIS:
+        if self._frame_count < self.MIN_FRAMES:
             return
 
-        # Detect stride events
-        self._detect_strides(pose.timestamp)
+        self._update_camera_mode()
+        self._detect_strides(now, body_scale)
 
-        # Compute and publish metrics if we have enough strides
-        if len(self._strides) >= 2:
-            metrics = self._compute_metrics(pose)
+        if len(self._strides) >= 1:
+            metrics = self._compute_metrics(pose, body_scale)
             self.latest_metrics = metrics
             self._update_baseline(metrics)
             self._log_metrics(metrics)
 
     # ─────────────────────────────────────────
-    # Stride detection
+    # Camera orientation detection
     # ─────────────────────────────────────────
 
-    def _detect_strides(self, now: float):
-        """
-        Detect heel strikes using ankle vertical velocity.
-
-        In a side-on or slightly elevated camera view, the ankle
-        reaches a local maximum Y value (lowest on screen = highest Y)
-        at heel strike. We detect this as a local peak in Y position.
-
-        For a top-down view, we detect the moment the ankle is furthest
-        from the body center (max distance from CoM).
-        """
-        self._detect_foot_strike("left",  self._left_ankle_history,  self._last_left_strike,  now)
-        self._detect_foot_strike("right", self._right_ankle_history, self._last_right_strike, now)
-
-    def _detect_foot_strike(self, foot: str, history: deque,
-                             last_strike: Optional[StrideEvent], now: float):
-        """Detect a strike event for one foot using local peak detection."""
-        if len(history) < 5:
+    def _update_camera_mode(self):
+        if len(self._left_ankle) < 10:
             return
+        recent = list(self._left_ankle)[-20:]
+        y_range = float(np.ptp([r[2] for r in recent]))
+        x_range = float(np.ptp([r[1] for r in recent]))
+        self._y_range_history.append(y_range)
+        self._x_range_history.append(x_range)
+        avg_y = float(np.mean(self._y_range_history))
+        avg_x = float(np.mean(self._x_range_history))
 
-        times = [h[0] for h in history]
-        positions = [h[1] for h in history]
-
-        # Use Y coordinate for strike detection (works for side view)
-        # Use distance from CoM for top-down view
-        # We use Y as primary — works for most home camera placements
-        y_vals = np.array([p[1] for p in positions])
-
-        # Detect local maximum in Y (lowest point on screen = heel strike)
-        # Check if the middle of the recent window is a local max
-        mid = len(y_vals) // 2
-        if mid < 2 or mid >= len(y_vals) - 2:
-            return
-
-        is_peak = (
-            y_vals[mid] > y_vals[mid - 1] and
-            y_vals[mid] > y_vals[mid - 2] and
-            y_vals[mid] > y_vals[mid + 1] and
-            y_vals[mid] > y_vals[mid + 2]
-        )
-
-        if not is_peak:
-            return
-
-        strike_time = times[mid]
-        strike_pos = positions[mid]
-
-        # Debounce — ignore if too soon after last strike
-        if last_strike and (strike_time - last_strike.timestamp) < self.STRIDE_COOLDOWN_SEC:
-            return
-
-        # Ignore strikes too far in the past
-        if (now - strike_time) > 1.0:
-            return
-
-        # Compute stride length from last same-foot strike
-        stride_length = 0.0
-        stride_duration = 0.0
-        if last_strike:
-            dx = strike_pos[0] - last_strike.ankle_x
-            dy = strike_pos[1] - last_strike.ankle_y
-            stride_length = float(np.sqrt(dx**2 + dy**2))
-            stride_duration = strike_time - last_strike.timestamp
-
-            # Sanity check — reject implausible strides
-            if stride_duration < 0.3 or stride_duration > 3.0:
-                return
-            if stride_length < 5.0:  # sub-5px movement is noise
-                return
-
-        event = StrideEvent(
-            timestamp=strike_time,
-            foot=foot,
-            stride_length_px=stride_length,
-            stride_duration_sec=stride_duration,
-            ankle_x=float(strike_pos[0]),
-            ankle_y=float(strike_pos[1]),
-        )
-
-        self._strides.append(event)
-
-        # Update last strike reference
-        if foot == "left":
-            self._last_left_strike = event
+        if avg_y > avg_x * 1.5:
+            self._camera_mode = "side"
+        elif avg_x > avg_y * 1.5:
+            self._camera_mode = "front"
         else:
-            self._last_right_strike = event
-
-        logger.debug(f"Stride detected: {foot} foot | length={stride_length:.1f}px | duration={stride_duration:.2f}s")
+            self._camera_mode = "angled"
 
     # ─────────────────────────────────────────
-    # Metric computation
+    # Velocity-based stride detection
     # ─────────────────────────────────────────
 
-    def _compute_metrics(self, pose: PoseFrame) -> GaitMetrics:
-        now = pose.timestamp
+    def _detect_strides(self, now: float, body_scale: float):
+        self._process_foot("left",  self._left_ankle,  self._last_left,  now, body_scale)
+        self._process_foot("right", self._right_ankle, self._last_right, now, body_scale)
 
-        # ── Gait speed from CoM movement ──
-        speed = self._compute_speed()
-
-        # ── Stride length — average of recent strides with valid lengths ──
-        valid_strides = [s for s in self._strides if s.stride_length_px > 0]
-        stride_length = float(np.median([s.stride_length_px for s in valid_strides])) if valid_strides else 0.0
-
-        # ── Cadence — steps per minute from recent stride durations ──
-        cadence = self._compute_cadence()
-
-        # ── Asymmetry — compare left vs right stride timing ──
-        asymmetry = self._compute_asymmetry()
-
-        # ── Stance width — lateral distance between ankles ──
-        stance_width = self._compute_stance_width(pose)
-
-        # ── Walking detection ──
-        is_walking = speed > self.WALKING_MOTION_THRESH
-
-        if is_walking:
-            self._last_motion_time = now
-
-        # ── Baseline-relative flags ──
-        baseline_speed = self._baseline.get("speed_px_per_sec", None)
-        baseline_stride = self._baseline.get("stride_length_px", None)
-
-        slow_gait = (
-            baseline_speed is not None and
-            speed < (baseline_speed * 0.70) and
-            is_walking
-        )
-        is_shuffling = (
-            baseline_stride is not None and
-            stride_length > 0 and
-            stride_length < (baseline_stride * 0.40)
-        )
-
-        # ── Confidence — fraction of key lower-body keypoints visible ──
-        lower_body_kps = [KP.LEFT_HIP, KP.RIGHT_HIP, KP.LEFT_KNEE,
-                          KP.RIGHT_KNEE, KP.LEFT_ANKLE, KP.RIGHT_ANKLE]
-        visible = sum(1 for k in lower_body_kps if pose.get_xy(k) is not None)
-        confidence = visible / len(lower_body_kps)
-
-        return GaitMetrics(
-            timestamp=now,
-            speed_px_per_sec=round(speed, 2),
-            stride_length_px=round(stride_length, 2),
-            cadence_spm=round(cadence, 1),
-            asymmetry_pct=round(asymmetry, 1),
-            stance_width_px=round(stance_width, 2),
-            confidence=round(confidence, 2),
-            is_walking=is_walking,
-            is_shuffling=is_shuffling,
-            slow_gait=slow_gait,
-            recent_stride_lengths=[round(s.stride_length_px, 1) for s in list(self._strides)[-5:]],
-            recent_cadences=[],
-        )
-
-    def _compute_speed(self) -> float:
-        """CoM displacement over the last 1 second."""
-        if len(self._com_history) < 2:
-            return 0.0
-
-        now = self._com_history[-1][0]
-        cutoff = now - 1.0
-
-        recent = [(t, p) for t, p in self._com_history if t >= cutoff]
-        if len(recent) < 2:
-            return 0.0
-
-        # Total path length over the window
-        total_dist = 0.0
-        for i in range(1, len(recent)):
-            dp = recent[i][1] - recent[i-1][1]
-            total_dist += float(np.linalg.norm(dp))
-
-        elapsed = recent[-1][0] - recent[0][0]
-        return total_dist / elapsed if elapsed > 0 else 0.0
-
-    def _compute_cadence(self) -> float:
-        """Steps per minute from recent stride durations."""
-        recent = [s for s in self._strides
-                  if s.stride_duration_sec > 0 and
-                  (self._strides[-1].timestamp - s.timestamp) < 5.0]
-        if not recent:
-            return 0.0
-
-        avg_stride_duration = float(np.mean([s.stride_duration_sec for s in recent]))
-        # Each stride is one step — cadence = steps/min
-        return 60.0 / avg_stride_duration if avg_stride_duration > 0 else 0.0
-
-    def _compute_asymmetry(self) -> float:
-        """
-        Asymmetry between left and right stride timing.
-        Uses the Neurocom asymmetry index: |L-R| / (0.5*(L+R)) * 100
-        """
-        left_strides  = [s for s in self._strides if s.foot == "left"  and s.stride_duration_sec > 0]
-        right_strides = [s for s in self._strides if s.foot == "right" and s.stride_duration_sec > 0]
-
-        if not left_strides or not right_strides:
-            return 0.0
-
-        avg_left  = float(np.mean([s.stride_duration_sec for s in left_strides[-3:]]))
-        avg_right = float(np.mean([s.stride_duration_sec for s in right_strides[-3:]]))
-
-        denom = 0.5 * (avg_left + avg_right)
-        if denom == 0:
-            return 0.0
-
-        return abs(avg_left - avg_right) / denom * 100.0
-
-    def _compute_stance_width(self, pose: PoseFrame) -> float:
-        """Lateral distance between ankles during stance phase."""
-        left  = pose.get_xy(KP.LEFT_ANKLE)
-        right = pose.get_xy(KP.RIGHT_ANKLE)
-        if left is None or right is None:
-            return 0.0
-        # Horizontal distance only
-        return abs(float(left[0]) - float(right[0]))
-
-    # ─────────────────────────────────────────
-    # Baseline learning
-    # ─────────────────────────────────────────
-
-    def _update_baseline(self, metrics: GaitMetrics):
-        """
-        Build personal baseline from first N strides.
-        Uses median to be robust against outliers.
-        """
-        if self._baseline_locked:
-            return
-        if not metrics.is_walking:
+    def _process_foot(self, foot: str, history: deque,
+                      last: Optional[StrideEvent], now: float, body_scale: float):
+        if len(history) < self.SMOOTHING_WINDOW + 4:
             return
 
-        self._baseline_samples.append({
-            "speed": metrics.speed_px_per_sec,
-            "stride": metrics.stride_length_px,
-            "cadence": metrics.cadence_spm,
-        })
+        data  = list(history)
+        times = np.array([d[0] for d in data])
+        xs    = np.array([d[1] for d in data])
+        ys    = np.array([d[2] for d in data])
 
-        if len(self._baseline_samples) >= self._baseline_lock_after_n_strides:
-            self._baseline = {
-                "speed_px_per_sec":  float(np.median([s["speed"]   for s in self._baseline_samples])),
-                "stride_length_px":  float(np.median([s["stride"]  for s in self._baseline_samples])),
-                "cadence_spm":       float(np.median([s["cadence"] for s in self._baseline_samples])),
-            }
-            self._baseline_locked = True
-            logger.info(
-                f"Baseline locked after {len(self._baseline_samples)} samples: "
-                f"speed={self._baseline['speed_px_per_sec']:.1f}px/s "
-                f"stride={self._baseline['stride_length_px']:.1f}px "
-                f"cadence={self._baseline['cadence_spm']:.1f}spm"
+        # Smooth
+        win = min(self.SMOOTHING_WINDOW, len(data) - 1)
+        if win % 2 == 0:
+            win -= 1
+        if win < 3:
+            return
+        try:
+            xs_s = savgol_filter(xs, win, self.SMOOTHING_POLY)
+            ys_s = savgol_filter(ys, win, self.SMOOTHING_POLY)
+        except Exception:
+            xs_s, ys_s = xs, ys
+
+        # Velocity
+        dt = np.diff(times)
+        dt = np.where(dt < 1e-6, 1e-6, dt)
+        vx = np.diff(xs_s) / dt
+        vy = np.diff(ys_s) / dt
+        speed = np.sqrt(vx**2 + vy**2)
+
+        # Choose signal axis based on camera mode
+        if self._camera_mode == "side":
+            signal = np.abs(vy)
+        elif self._camera_mode == "front":
+            signal = np.abs(vx)
+        else:
+            signal = speed
+
+        if len(signal) < 5:
+            return
+
+        avg_dt = float(np.mean(dt))
+        min_dist = max(3, int(self.STRIDE_COOLDOWN_SEC / avg_dt))
+
+        peaks, _ = find_peaks(
+            signal,
+            height=self.MIN_SWING_VELOCITY,
+            distance=min_dist,
+            prominence=10.0,
+        )
+
+        for peak_idx in peaks:
+            # Find heel strike = first trough after velocity peak
+            post = signal[peak_idx:]
+            troughs = np.where(post < self.MIN_SWING_VELOCITY * 0.3)[0]
+            strike_idx = peak_idx + (troughs[0] if len(troughs) > 0 else 0)
+            strike_idx = min(strike_idx, len(times) - 1)
+
+            strike_time = times[strike_idx]
+            strike_x    = xs_s[strike_idx] if strike_idx < len(xs_s) else xs_s[-1]
+            strike_y    = ys_s[strike_idx] if strike_idx < len(ys_s) else ys_s[-1]
+
+            # Debounce
+            if last and (strike_time - last.timestamp) < self.STRIDE_COOLDOWN_SEC:
+                continue
+            if (now - strike_time) > 2.0:
+                continue
+            if self._strides and abs(self._strides[-1].timestamp - strike_time) < self.STRIDE_COOLDOWN_SEC:
+                continue
+
+            # Stride metrics
+            stride_px = stride_norm = stride_dur = 0.0
+            if last:
+                dx = strike_x - last.ankle_x
+                dy = strike_y - last.ankle_y
+                stride_px   = float(np.sqrt(dx**2 + dy**2))
+                stride_norm = stride_px / body_scale if body_scale > 0 else 0
+                stride_dur  = strike_time - last.timestamp
+                if stride_dur < 0.25 or stride_dur > 4.0:
+                    continue
+                if stride_px < body_scale * 0.05:
+                    continue
+
+            event = StrideEvent(
+                timestamp=strike_time,
+                foot=foot,
+                stride_length_px=stride_px,
+                stride_length_normalized=stride_norm,
+                stride_duration_sec=stride_dur,
+                ankle_x=float(strike_x),
+                ankle_y=float(strike_y),
+                peak_velocity=float(signal[peak_idx]),
+            )
+            self._strides.append(event)
+
+            if foot == "left":
+                self._last_left = event
+            else:
+                self._last_right = event
+
+            logger.debug(
+                f"Stride: {foot} | "
+                f"len={stride_px:.0f}px ({stride_norm:.2f}x) | "
+                f"dur={stride_dur:.2f}s | "
+                f"vel={signal[peak_idx]:.0f}px/s | "
+                f"cam={self._camera_mode}"
             )
 
     # ─────────────────────────────────────────
-    # Logging
+    # Metrics
     # ─────────────────────────────────────────
+
+    def _compute_metrics(self, pose: PoseFrame, body_scale: float) -> GaitMetrics:
+        now = pose.timestamp
+        speed = self._compute_speed()
+        speed_norm = speed / body_scale if body_scale > 0 else 0
+
+        valid = [s for s in self._strides if s.stride_length_px > 0]
+        stride_px   = float(np.median([s.stride_length_px for s in valid])) if valid else 0.0
+        stride_norm = float(np.median([s.stride_length_normalized for s in valid])) if valid else 0.0
+
+        cadence    = self._compute_cadence()
+        asymmetry  = self._compute_asymmetry()
+        stance     = self._compute_stance_width(pose)
+        regularity = self._compute_regularity()
+        is_walking = speed > 15.0
+
+        bl_speed  = self._baseline.get("speed_normalized")
+        bl_stride = self._baseline.get("stride_length_normalized")
+        slow_gait    = bl_speed  is not None and speed_norm  < bl_speed  * 0.70 and is_walking
+        is_shuffling = bl_stride is not None and stride_norm > 0 and stride_norm < bl_stride * 0.40
+        high_asym    = asymmetry > 25.0
+
+        lower_kps = [KP.LEFT_HIP, KP.RIGHT_HIP, KP.LEFT_KNEE, KP.RIGHT_KNEE, KP.LEFT_ANKLE, KP.RIGHT_ANKLE]
+        visible = sum(1 for k in lower_kps if pose.get(k).confidence > 0.3)
+        kp_conf = visible / len(lower_kps)
+
+        return GaitMetrics(
+            timestamp=now,
+            speed_px_per_sec=round(speed, 1),
+            speed_normalized=round(speed_norm, 3),
+            stride_length_px=round(stride_px, 1),
+            stride_length_normalized=round(stride_norm, 3),
+            cadence_spm=round(cadence, 1),
+            asymmetry_pct=round(asymmetry, 1),
+            stance_width_px=round(stance, 1),
+            step_regularity=round(regularity, 3),
+            body_scale_px=round(body_scale, 1),
+            camera_mode=self._camera_mode,
+            keypoint_confidence=round(kp_conf, 2),
+            is_walking=is_walking,
+            is_shuffling=is_shuffling,
+            slow_gait=slow_gait,
+            high_asymmetry=high_asym,
+            recent_stride_lengths=[round(s.stride_length_normalized, 3) for s in list(self._strides)[-6:]],
+        )
+
+    def _compute_speed(self) -> float:
+        if len(self._com) < 2:
+            return 0.0
+        now = self._com[-1][0]
+        w = [(t, p) for t, p in self._com if t >= now - 1.5]
+        if len(w) < 2:
+            return 0.0
+        dist = sum(float(np.linalg.norm(w[i][1] - w[i-1][1])) for i in range(1, len(w)))
+        elapsed = w[-1][0] - w[0][0]
+        return dist / elapsed if elapsed > 0 else 0.0
+
+    def _compute_cadence(self) -> float:
+        recent = [s for s in self._strides
+                  if s.stride_duration_sec > 0 and
+                  (self._strides[-1].timestamp - s.timestamp) < 8.0]
+        if not recent:
+            return 0.0
+        avg = float(np.mean([s.stride_duration_sec for s in recent]))
+        return 60.0 / avg if avg > 0 else 0.0
+
+    def _compute_asymmetry(self) -> float:
+        left  = [s for s in self._strides if s.foot == "left"  and s.stride_duration_sec > 0]
+        right = [s for s in self._strides if s.foot == "right" and s.stride_duration_sec > 0]
+        if not left or not right:
+            return 0.0
+        l = float(np.mean([s.stride_duration_sec for s in left[-4:]]))
+        r = float(np.mean([s.stride_duration_sec for s in right[-4:]]))
+        denom = 0.5 * (l + r)
+        return abs(l - r) / denom * 100.0 if denom > 0 else 0.0
+
+    def _compute_stance_width(self, pose: PoseFrame) -> float:
+        la = pose.get_xy(KP.LEFT_ANKLE)
+        ra = pose.get_xy(KP.RIGHT_ANKLE)
+        if la is None or ra is None:
+            return 0.0
+        return abs(float(la[0]) - float(ra[0]))
+
+    def _compute_regularity(self) -> float:
+        durs = [s.stride_duration_sec for s in self._strides if s.stride_duration_sec > 0]
+        if len(durs) < 4:
+            return 1.0
+        d = np.array(durs) - np.mean(durs)
+        if d.std() < 1e-6:
+            return 1.0
+        ac = float(np.corrcoef(d[:-1], d[1:])[0, 1])
+        return max(0.0, min(1.0, (ac + 1.0) / 2.0))
+
+    # ─────────────────────────────────────────
+    # Baseline
+    # ─────────────────────────────────────────
+
+    def _update_baseline(self, m: GaitMetrics):
+        if self._baseline_locked or not m.is_walking:
+            return
+        if m.speed_normalized <= 0 or m.stride_length_normalized <= 0:
+            return
+        self._baseline_samples.append({
+            "speed_normalized":  m.speed_normalized,
+            "stride_normalized": m.stride_length_normalized,
+            "cadence":           m.cadence_spm,
+        })
+        if len(self._baseline_samples) >= self.BASELINE_STRIDES:
+            self._baseline = {
+                "speed_normalized":         float(np.median([s["speed_normalized"]  for s in self._baseline_samples])),
+                "stride_length_normalized": float(np.median([s["stride_normalized"] for s in self._baseline_samples])),
+                "cadence_spm":              float(np.median([s["cadence"]           for s in self._baseline_samples])),
+            }
+            self._baseline_locked = True
+            logger.info(f"Baseline locked | {self._baseline}")
 
     def _log_metrics(self, m: GaitMetrics):
         flags = []
-        if m.slow_gait:    flags.append("SLOW_GAIT")
-        if m.is_shuffling: flags.append("SHUFFLING")
+        if m.slow_gait:      flags.append("SLOW_GAIT")
+        if m.is_shuffling:   flags.append("SHUFFLING")
+        if m.high_asymmetry: flags.append("HIGH_ASYMMETRY")
         if not m.is_walking: flags.append("STATIONARY")
-
-        flag_str = " ".join(flags) if flags else "nominal"
-
         logger.info(
-            f"GAIT | "
-            f"speed={m.speed_px_per_sec:.1f}px/s | "
-            f"stride={m.stride_length_px:.1f}px | "
-            f"cadence={m.cadence_spm:.1f}spm | "
-            f"asym={m.asymmetry_pct:.1f}% | "
-            f"conf={m.confidence:.2f} | "
-            f"{flag_str}"
+            f"GAIT | cam={m.camera_mode} | "
+            f"speed={m.speed_px_per_sec:.0f}px/s ({m.speed_normalized:.2f}x) | "
+            f"stride={m.stride_length_normalized:.2f}x | "
+            f"cadence={m.cadence_spm:.0f}spm | "
+            f"asym={m.asymmetry_pct:.0f}% | "
+            f"reg={m.step_regularity:.2f} | "
+            f"strides={self.stride_count} | "
+            f"{' '.join(flags) if flags else 'nominal'}"
         )
-
-    # ─────────────────────────────────────────
-    # Accessors
-    # ─────────────────────────────────────────
 
     @property
     def baseline(self) -> dict:
@@ -485,3 +433,7 @@ class GaitModule:
     @property
     def stride_count(self) -> int:
         return len(self._strides)
+
+    @property
+    def camera_mode(self) -> str:
+        return self._camera_mode

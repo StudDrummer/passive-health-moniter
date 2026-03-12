@@ -1,16 +1,11 @@
 """
-vigil/core/ingestion.py
+vigil/ingestion.py
 
-Frame ingestion layer.
-Handles camera capture from:
-  - USB camera
+Frame ingestion — supports:
   - CSI camera via GStreamer (Jetson)
-  - RTSP IP camera
-  - Test pattern (no hardware)
-
-Produces a clean stream of BGR frames for the pose estimator.
-Runs in its own thread with a queue so the pose module is never
-blocked waiting on I/O.
+  - USB camera (index integer)
+  - Video file (.mp4, .mov, .avi) — for testing
+  - Synthetic test pattern ("test")
 """
 
 import cv2
@@ -27,10 +22,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CapturedFrame:
-    """Raw frame container. Short-lived — consumed immediately by pose module."""
-    bgr: np.ndarray          # H x W x 3 uint8. Never persisted.
-    timestamp: float         # time.monotonic()
-    wall_time: float         # time.time()
+    bgr: np.ndarray
+    timestamp: float
+    wall_time: float
     frame_index: int
     width: int
     height: int
@@ -38,20 +32,20 @@ class CapturedFrame:
 
 class FrameIngestion:
     """
-    Manages camera capture lifecycle.
+    Manages camera/video capture lifecycle.
 
-    Usage:
-        ingestion = FrameIngestion(config)
-        ingestion.start()
-        for frame in ingestion.frames():
-            process(frame)
-        ingestion.stop()
+    Source types (set via config camera.source):
+        0, 1, 2          → USB camera index
+        "test"           → synthetic moving pattern
+        "rtsp://..."     → IP camera
+        "file.mp4"       → video file (any string ending in video extension)
 
-    Or as a context manager:
-        with FrameIngestion(config) as ingestion:
-            for frame in ingestion.frames():
-                ...
+    GStreamer (for Jetson CSI camera):
+        Set use_gstreamer: true in config.
+        The gstreamer_pipeline string is used directly.
     """
+
+    VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.m4v', '.hevc')
 
     def __init__(self, config: dict):
         self.config = config
@@ -61,33 +55,37 @@ class FrameIngestion:
         self.target_fps = config["camera"]["fps"]
         self.use_gstreamer = config["camera"].get("use_gstreamer", False)
 
-        self._cap: Optional[cv2.VideoCapture] = None
+        self._is_video_file = self._check_is_video_file()
+
+        self._cap = None
         self._thread: Optional[threading.Thread] = None
-        self._queue: queue.Queue = queue.Queue(maxsize=4)  # small buffer — we want fresh frames
+        self._queue: queue.Queue = queue.Queue(maxsize=4)
         self._running = False
         self._frame_index = 0
-        self._lock = threading.Lock()
 
-        # Stats
         self._fps_counter = 0
         self._fps_start = time.monotonic()
         self._current_fps = 0.0
 
-    # ──────────────────────────────────────────
-    # Lifecycle
-    # ──────────────────────────────────────────
+    def _check_is_video_file(self) -> bool:
+        if isinstance(self.source, str):
+            src_lower = self.source.lower()
+            return any(src_lower.endswith(ext) for ext in self.VIDEO_EXTENSIONS)
+        return False
 
     def start(self) -> "FrameIngestion":
-        """Open the camera and start the capture thread."""
         self._cap = self._open_capture()
         self._running = True
-        self._thread = threading.Thread(target=self._capture_loop, daemon=True, name="vigil-capture")
+        self._thread = threading.Thread(
+            target=self._capture_loop if not self._is_video_file else self._video_loop,
+            daemon=True,
+            name="vigil-capture"
+        )
         self._thread.start()
-        logger.info(f"Ingestion started — source={self.source} resolution={self.target_w}x{self.target_h} fps={self.target_fps}")
+        logger.info(f"Ingestion started | source={self.source} | {self.target_w}x{self.target_h} @ {self.target_fps}fps")
         return self
 
     def stop(self):
-        """Stop capture and release resources."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=3.0)
@@ -101,16 +99,7 @@ class FrameIngestion:
     def __exit__(self, *_):
         self.stop()
 
-    # ──────────────────────────────────────────
-    # Frame access
-    # ──────────────────────────────────────────
-
     def frames(self, timeout: float = 2.0) -> Generator[CapturedFrame, None, None]:
-        """
-        Generator that yields frames as they arrive.
-        Blocks up to `timeout` seconds waiting for each frame.
-        Raises StopIteration cleanly when pipeline stops.
-        """
         while self._running:
             try:
                 frame = self._queue.get(timeout=timeout)
@@ -118,14 +107,7 @@ class FrameIngestion:
             except queue.Empty:
                 if not self._running:
                     break
-                logger.warning("Frame queue empty — camera may have stalled.")
-
-    def get_frame_nowait(self) -> Optional[CapturedFrame]:
-        """Non-blocking: return latest frame or None."""
-        try:
-            return self._queue.get_nowait()
-        except queue.Empty:
-            return None
+                logger.warning("Frame queue empty.")
 
     @property
     def fps(self) -> float:
@@ -135,135 +117,178 @@ class FrameIngestion:
     def is_running(self) -> bool:
         return self._running
 
-    # ──────────────────────────────────────────
-    # Internal
-    # ──────────────────────────────────────────
-
     def _open_capture(self) -> cv2.VideoCapture:
+        # Synthetic test source
         if self.source == "test":
-            logger.info("Using synthetic test source (no camera hardware)")
+            logger.info("Using synthetic test source")
             return _TestCapture(self.target_w, self.target_h, self.target_fps)
 
+        # Video file
+        if self._is_video_file:
+            logger.info(f"Opening video file: {self.source}")
+            cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                raise RuntimeError(f"Could not open video file: {self.source}")
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            logger.info(f"Video: {actual_w}x{actual_h} @ {fps:.1f}fps | {total} frames ({total/fps:.1f}s)")
+            return cap
+
+        # GStreamer CSI camera
         if self.use_gstreamer:
             pipeline = self.config["camera"]["gstreamer_pipeline"]
-            logger.info(f"Opening GStreamer pipeline: {pipeline[:80]}...")
+            logger.info(f"Opening GStreamer pipeline...")
             cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         else:
-            logger.info(f"Opening camera source: {self.source}")
+            # USB camera
+            logger.info(f"Opening USB camera: {self.source}")
             cap = cv2.VideoCapture(self.source)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_h)
             cap.set(cv2.CAP_PROP_FPS, self.target_fps)
-            # Minimize internal buffer to keep frames fresh
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not cap.isOpened():
             raise RuntimeError(
                 f"Failed to open camera source: {self.source}\n"
-                f"  If using Jetson CSI camera, set use_gstreamer: true in config.\n"
-                f"  If testing without hardware, set source: 'test' in config."
+                f"  CSI camera: set use_gstreamer: true in config\n"
+                f"  No hardware: set source: 'test'"
             )
 
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        actual_fps = cap.get(cv2.CAP_PROP_FPS)
-        logger.info(f"Camera opened: {actual_w}x{actual_h} @ {actual_fps:.1f}fps")
+        logger.info(f"Camera opened: {actual_w}x{actual_h} @ {cap.get(cv2.CAP_PROP_FPS):.1f}fps")
         return cap
 
     def _capture_loop(self):
-        """Runs in background thread. Reads frames and puts them in the queue."""
-        consecutive_failures = 0
-        max_failures = 30
-
+        """Live camera loop — drops stale frames, always keeps freshest."""
+        failures = 0
         while self._running:
             ret, bgr = self._cap.read()
-
             if not ret:
-                consecutive_failures += 1
-                logger.warning(f"Frame read failed ({consecutive_failures}/{max_failures})")
-                if consecutive_failures >= max_failures:
-                    logger.error("Too many consecutive frame failures. Stopping ingestion.")
+                failures += 1
+                if failures >= 30:
+                    logger.error("Too many frame failures. Stopping.")
                     self._running = False
                     break
                 time.sleep(0.05)
                 continue
 
-            consecutive_failures = 0
-
-            # Resize if camera returned different resolution than requested
+            failures = 0
             h, w = bgr.shape[:2]
             if w != self.target_w or h != self.target_h:
                 bgr = cv2.resize(bgr, (self.target_w, self.target_h))
 
             now = time.monotonic()
             frame = CapturedFrame(
-                bgr=bgr,
-                timestamp=now,
-                wall_time=time.time(),
+                bgr=bgr, timestamp=now, wall_time=time.time(),
                 frame_index=self._frame_index,
-                width=self.target_w,
-                height=self.target_h,
+                width=self.target_w, height=self.target_h,
             )
             self._frame_index += 1
 
-            # Drop oldest frame if queue is full (always prefer fresh frames)
+            # Drop oldest if full — always keep freshest
             if self._queue.full():
                 try:
                     self._queue.get_nowait()
                 except queue.Empty:
                     pass
-
             self._queue.put(frame)
+            self._update_fps(now)
 
-            # FPS tracking
-            self._fps_counter += 1
-            elapsed = now - self._fps_start
-            if elapsed >= 2.0:
-                self._current_fps = self._fps_counter / elapsed
-                self._fps_counter = 0
-                self._fps_start = now
+    def _video_loop(self):
+        """
+        Video file loop — plays at real-time speed based on file FPS.
+        Resizes frames to target resolution.
+        Loops video if it ends (for testing).
+        """
+        file_fps = self._cap.get(cv2.CAP_PROP_FPS)
+        if file_fps <= 0:
+            file_fps = 30.0
+        frame_delay = 1.0 / file_fps
+
+        logger.info(f"Video playback at {file_fps:.1f}fps (frame delay: {frame_delay*1000:.1f}ms)")
+
+        while self._running:
+            t_start = time.monotonic()
+            ret, bgr = self._cap.read()
+
+            if not ret:
+                # End of video — loop back
+                logger.info("Video ended — looping")
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+
+            # Resize to target resolution
+            h, w = bgr.shape[:2]
+            if w != self.target_w or h != self.target_h:
+                # Preserve aspect ratio with letterboxing
+                bgr = self._letterbox(bgr, self.target_w, self.target_h)
+
+            now = time.monotonic()
+            frame = CapturedFrame(
+                bgr=bgr, timestamp=now, wall_time=time.time(),
+                frame_index=self._frame_index,
+                width=self.target_w, height=self.target_h,
+            )
+            self._frame_index += 1
+            self._queue.put(frame)
+            self._update_fps(now)
+
+            # Pace to real-time
+            elapsed = time.monotonic() - t_start
+            sleep = frame_delay - elapsed
+            if sleep > 0:
+                time.sleep(sleep)
+
+    def _letterbox(self, bgr: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+        """Resize preserving aspect ratio, pad with black bars."""
+        h, w = bgr.shape[:2]
+        scale = min(target_w / w, target_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(bgr, (new_w, new_h))
+        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        x_off = (target_w - new_w) // 2
+        y_off = (target_h - new_h) // 2
+        canvas[y_off:y_off+new_h, x_off:x_off+new_w] = resized
+        return canvas
+
+    def _update_fps(self, now: float):
+        self._fps_counter += 1
+        elapsed = now - self._fps_start
+        if elapsed >= 2.0:
+            self._current_fps = self._fps_counter / elapsed
+            self._fps_counter = 0
+            self._fps_start = now
 
 
 class _TestCapture:
-    """
-    Synthetic camera that generates moving skeleton test frames.
-    No hardware required — useful for unit testing and CI.
-    """
-
-    def __init__(self, width: int, height: int, fps: int):
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self._frame_time = 1.0 / fps
+    """Synthetic moving pattern — no hardware needed."""
+    def __init__(self, w, h, fps):
+        self.width, self.height, self.fps = w, h, fps
         self._t = 0.0
-        self._opened = True
+        self._delay = 1.0 / fps
 
-    def isOpened(self) -> bool:
-        return self._opened
+    def isOpened(self): return True
 
     def read(self):
-        time.sleep(self._frame_time)
-        self._t += self._frame_time
+        time.sleep(self._delay)
+        self._t += self._delay
         frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        # Draw a simple moving circle so the frame isn't completely static
-        cx = int(self.width / 2 + np.sin(self._t) * 100)
-        cy = int(self.height / 2 + np.cos(self._t * 0.7) * 60)
-        cv2.circle(frame, (cx, cy), 30, (0, 200, 150), -1)
+        cx = int(self.width/2 + np.sin(self._t) * 150)
+        cy = int(self.height/2 + np.cos(self._t*0.7) * 80)
+        cv2.circle(frame, (cx, cy), 40, (0, 200, 150), -1)
         cv2.putText(frame, "VIGIL TEST SOURCE", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 80, 80), 1)
         return True, frame
 
-    def get(self, prop_id: int) -> float:
-        if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
-            return float(self.width)
-        if prop_id == cv2.CAP_PROP_FRAME_HEIGHT:
-            return float(self.height)
-        if prop_id == cv2.CAP_PROP_FPS:
-            return float(self.fps)
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:  return float(self.width)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT: return float(self.height)
+        if prop == cv2.CAP_PROP_FPS:          return float(self.fps)
         return 0.0
 
-    def set(self, *_):
-        pass
-
-    def release(self):
-        self._opened = False
+    def set(self, *_): pass
+    def release(self): pass
