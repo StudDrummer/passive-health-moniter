@@ -1,5 +1,37 @@
-venv/
+cat > ~/passive-health-moniter/.gitignore << 'EOF'
+# Model weights
+*.pt
+*.onnx
+
+# Database and personal data
+*.db
+*.db-shm
+*.db-wal
+
+# Logs and reports
+*.log
+anomaly_report.json
+
+# Test videos
+*.mp4
+*.avi
+*.mov
+
+# Python cache
 __pycache__/
 *.pyc
-.DS_Storegit add .
-git status
+*.pyo
+.pytest_cache/
+
+# Environment
+.env
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Desktop folder
+Desktop/
+EOF

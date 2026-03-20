@@ -21,7 +21,7 @@ import yaml
 from ingestion import FrameIngestion
 from pose_estimator import PoseEstimator
 from data_types import PoseFrame
-from gait import GaitModule
+from gait_snapshot import GaitModule
 
 logger = logging.getLogger(__name__)
 
