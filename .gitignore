@@ -35,3 +35,12 @@ Thumbs.db
 # Desktop folder
 Desktop/
 EOF
+
+cat >> .gitignore << 'EOF'
+
+# App code — keep private
+App.tsx
+App.tsx.save
+VIGILApp/
+venv/
+EOF

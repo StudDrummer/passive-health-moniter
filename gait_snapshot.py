@@ -272,7 +272,7 @@ def aggergate_session(frame_metrices: list, camera_mode: str) -> dict:
     return snapshot
  
  #debug overlay
- def draw_overlay(frame, kps, metrics: dict, session_metrics: dict):
+def draw_overlay(frame, kps, metrics: dict, session_metrics: dict):
     """Draw keypoints, skeleton, and metric values on frame."""
     h, w = frame.shape[:2]
  
