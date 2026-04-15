@@ -29,6 +29,8 @@ Output per condition:
   }
 """
 
+
+
 import os, json, math, sqlite3
 from datetime import datetime
 from typing import Optional
@@ -36,6 +38,8 @@ import numpy as np
 import joblib
 
 import vigil_ml.vigil_features as vf
+
+
 
 # ─── Model registry ───────────────────────────────────────────────────────────
 
@@ -246,6 +250,17 @@ def save_scores_to_db(db_path: str, result: dict):
             s['published_auc'], health_index,
             json.dumps(s.get('top_signals', [])),
         ))
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS ml_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            condition_id TEXT,
+            condition TEXT,
+            score REAL,
+            category TEXT,
+            level TEXT,
+            scored_at TEXT
+        )
+        """)
     conn.commit()
     conn.close()
 
