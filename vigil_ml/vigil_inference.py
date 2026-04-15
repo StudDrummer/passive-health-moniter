@@ -254,8 +254,10 @@ def save_scores_to_db(db_path: str, result: dict):
         CREATE TABLE IF NOT EXISTS ml_scores (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             condition_id TEXT,
+            condition_label TEXT,
             condition TEXT,
             score REAL,
+            probability REAL,
             category TEXT,
             level TEXT,
             scored_at TEXT
