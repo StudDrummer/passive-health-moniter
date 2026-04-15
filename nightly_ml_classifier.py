@@ -261,18 +261,39 @@ def _synth(cond_id: str, n=80):
             fake = [{k: max(0.,float(rng.normal(m,s))) for k,(m,s) in pop.items()} for _ in range(14)]
             f,_,_ = fn(fake)
             X.append(_n2z(f)); y.append(yv)
-    return np.array(X), np.array(y)
+    X = np.array(X); y = np.array(y)
+    # Sanity check: if classes are not separable (all features zeroed from
+    # missing keys in fake rows), classifier is noise — return None.
+    healthy_mean = X[y==0].mean(axis=0)
+    disease_mean = X[y==1].mean(axis=0)
+    if np.linalg.norm(disease_mean - healthy_mean) < 0.5:
+        return None, None
+    return X, y
 
 
 def _ref_score(cond_id, feats):
     X, y = _synth(cond_id)
     if X is None or X.shape[1] != len(feats): return 0.0
     mt = CONDITIONS[cond_id]["model"]
-    if mt=="rf":   clf=Pipeline([("sc",StandardScaler()),("clf",RandomForestClassifier(100,random_state=42,n_jobs=-1))])
-    elif mt=="gb": clf=Pipeline([("sc",StandardScaler()),("clf",GradientBoostingClassifier(100,random_state=42))])
-    else:          clf=Pipeline([("sc",StandardScaler()),("clf",LogisticRegression(random_state=42,max_iter=500))])
+    # BUG FIX: n_estimators must be keyword arg in this sklearn version
+    if mt=="rf":
+        clf=Pipeline([("sc",StandardScaler()),
+                      ("clf",RandomForestClassifier(n_estimators=100,random_state=42,n_jobs=-1))])
+    elif mt=="gb":
+        clf=Pipeline([("sc",StandardScaler()),
+                      ("clf",GradientBoostingClassifier(n_estimators=100,random_state=42))])
+    else:
+        clf=Pipeline([("sc",StandardScaler()),
+                      ("clf",LogisticRegression(random_state=42,max_iter=500))])
     clf.fit(X, y)
-    return float(clf.predict_proba(feats.reshape(1,-1))[0][1])
+    prob = float(clf.predict_proba(feats.reshape(1,-1))[0][1])
+    # Sanity check: if model predicts healthy centroid as disease, classifier
+    # is inverted (happens when feature space is degenerate) — return 0.
+    healthy_centroid = X[y==0].mean(axis=0)
+    healthy_pred = float(clf.predict_proba(healthy_centroid.reshape(1,-1))[0][1])
+    if healthy_pred > 0.5:
+        return 0.0  # classifier inverted — discard ref score
+    return prob
 
 
 def _iso_score(feat_matrix):
