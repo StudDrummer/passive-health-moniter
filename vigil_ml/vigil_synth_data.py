@@ -225,3 +225,53 @@ def build_dataset(condition_id: str, n_cases=200, n_controls=400, days=21):
     cases    = case_gen(n_cases, days)
     controls = ctrl_gen(n_controls, days)
     return cases + controls
+import sqlite3
+from datetime import datetime
+
+def seed_daily_summary(db_path: str, n_patients: int = 50, days: int = 30):
+    """
+    Writes synthetic healthy + disease patterns into daily_summary table.
+    """
+    conn = sqlite3.connect(db_path)
+
+    def insert_row(date, row):
+        conn.execute("""
+            INSERT OR REPLACE INTO daily_summary (
+                date, step_count, walking_speed_ms,
+                walking_asymmetry_pct, walking_step_length_m,
+                double_support_pct, hrv_sdnn, resting_hr,
+                sleep_hours, active_calories, spo2_avg,
+                respiratory_rate, vo2_max, wrist_temp,
+                camera_cadence_spm, camera_asymmetry_pct,
+                camera_gait_speed, anomaly_score,
+                anomaly_flag, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            date,
+            row.get("step_count"),
+            row.get("walking_speed_ms"),
+            row.get("walking_asymmetry"),
+            row.get("step_length"),
+            row.get("double_support"),
+            row.get("hrv_sdnn"),
+            row.get("resting_hr"),
+            row.get("sleep_hours"),
+            row.get("active_calories"),
+            row.get("spo2_avg"),
+            row.get("respiratory_rate"),
+            row.get("vo2_max"),
+            row.get("wrist_temp"),
+            None, None, None,
+            0.0,
+            0,
+            datetime.now().isoformat()
+        ))
+
+    # generate simple healthy dataset only (safe seed)
+    for i in range(days):
+        date = (datetime.now()).isoformat()
+        row = _row_from_dist(HEALTHY)
+        insert_row(date, row)
+
+    conn.commit()
+    conn.close()
