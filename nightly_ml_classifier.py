@@ -181,7 +181,7 @@ def features_neuropathy(rows):
     ca=_vals(rows,"camera_asymmetry_pct")
     key=(_cov(rows,"double_support_pct")+_cov(rows,"stride_variability"))/2
     f=[_m(ds),_tr(ds),_m(sv),_tr(sv),_m(ca)]
-    n=["neuro_ds_mean","neuro_ds_trend","neuro_sv_mean","neuro_sv_trend","neuro_trunk"]
+    n=["neuro_ds_mean","neuro_ds_trend","neuro_sv_mean","neuro_sv_trend","neuro_cam_asym"]
     return np.array(f,dtype=float),n,key
 
 def features_heart_failure(rows):
@@ -368,8 +368,10 @@ def run(db_path, dry_run=False, explain=False):
         iso=_iso_score(np.array(rolling)) if len(rolling)>=5 else 0.
 
         has_ref = cid in REF
-        prob = (0.65*ref+0.35*iso if has_ref else iso) * min(1., key_cov/0.8)
-        s100 = round(prob*100, 1)
+        personal_anomaly_score = iso          # "unusual for YOU"
+        population_risk_score  = ref          # "resembles disease population"
+        combined = personal_anomaly_score     # trust this one more until you have real training data
+        s100 = round(combined*100, 1)
 
         level="HIGH" if s100>=70 else "ELEVATED" if s100>=50 else "LOW"
         print(f"  [{level:8s}] {cond['label']:32s} score={s100:5.1f}/100  "
@@ -437,3 +439,9 @@ if __name__ == "__main__":
     db=Path(a.db)
     if not db.exists(): print(f"[ERROR] {db} not found",file=sys.stderr); sys.exit(1)
     run(db, dry_run=a.dry_run, explain=a.explain)
+
+def _has_recent_data(rows, required_recent_days=5):
+    """Require data in the last 5 days, not just historical data."""
+    recent_dates = [r["date"] for r in rows[-5:]]
+    cutoff = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
+    return any(d >= cutoff for d in recent_dates)
