@@ -22,6 +22,34 @@ from datetime import datetime
 from flask import Flask, jsonify, request, send_file
 import sqlite3
 
+# ── At top of file, after existing imports ──────────────────────────
+import sys, os
+VIGIL_ML_DIR = os.path.expanduser("~/passive-health-moniter/vigil_ml")
+sys.path.insert(0, VIGIL_ML_DIR)
+from server_ml_patch import register_ml_routes
+
+# ── After app = Flask(__name__) ──────────────────────────────────────
+register_ml_routes(app, DB_PATH, VIGIL_ML_DIR)
+
+# ── In your /sync/healthkit handler, after _rebuild_daily_summary() ─
+# Add this non-blocking background scoring trigger:
+import threading
+
+def _bg_score():
+    try:
+        import vigil_inference as inf
+        conn = sqlite3.connect(DB_PATH)
+        n = conn.execute("SELECT COUNT(*) FROM daily_summary").fetchone()[0]
+        conn.close()
+        if n >= 7:
+            result = inf.score_from_db(DB_PATH)
+            inf.save_scores_to_db(DB_PATH, result)
+            print(f"[ML] Scored: health_index={result['health_index']}")
+    except Exception as e:
+        print(f"[ML] Scoring error: {e}")
+
+threading.Thread(target=_bg_score, daemon=True).start()
+
 app     = Flask(__name__)
 DB_PATH = os.path.expanduser("~/passive-health-moniter/vigil.db")
 
