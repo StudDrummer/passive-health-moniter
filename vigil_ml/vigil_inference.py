@@ -214,6 +214,8 @@ def save_scores_to_db(db_path: str, result: dict):
     Creates table if not present.
     """
     conn = sqlite3.connect(db_path)
+
+    # ✅ single source of truth schema
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ml_scores (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -233,8 +235,10 @@ def save_scores_to_db(db_path: str, result: dict):
             top_signals       TEXT
         )
     """)
+
     scored_at    = result.get('scored_at', datetime.now().isoformat())
     health_index = result.get('health_index', 100)
+
     for s in result.get('scores', []):
         conn.execute("""
             INSERT INTO ml_scores (
@@ -244,28 +248,24 @@ def save_scores_to_db(db_path: str, result: dict):
                 published_auc, health_index, top_signals
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            scored_at, s['condition_id'], s['condition_label'], s['category'],
-            s['probability'], s['score_0_100'], s['level'], int(s.get('urgent', False)),
-            s['completeness'], s['data_quality'], int(s.get('insufficient_data', False)),
-            s['published_auc'], health_index,
+            scored_at,
+            s['condition_id'],
+            s['condition_label'],
+            s['category'],
+            s['probability'],
+            s['score_0_100'],
+            s['level'],
+            int(s.get('urgent', False)),
+            s['completeness'],
+            s['data_quality'],
+            int(s.get('insufficient_data', False)),
+            s['published_auc'],
+            health_index,
             json.dumps(s.get('top_signals', [])),
         ))
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS ml_scores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            condition_id TEXT,
-            condition_label TEXT,
-            condition TEXT,
-            score REAL,
-            probability REAL,
-            category TEXT,
-            level TEXT,
-            scored_at TEXT
-        )
-        """)
+
     conn.commit()
     conn.close()
-
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
