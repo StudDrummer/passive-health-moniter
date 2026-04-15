@@ -35,7 +35,7 @@ from typing import Optional
 import numpy as np
 import joblib
 
-import vigil_features as vf
+import vigil_ml.vigil_features as vf
 
 # ─── Model registry ───────────────────────────────────────────────────────────
 

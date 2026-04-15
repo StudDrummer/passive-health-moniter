@@ -33,8 +33,8 @@ from sklearn.pipeline import Pipeline
 
 warnings.filterwarnings('ignore')
 
-import vigil_features as vf
-import vigil_synth_data as vsd
+import vigil_ml.vigil_features as vf
+import vigil_ml.vigil_synth_data as vsd
 
 # ─── Condition registry ───────────────────────────────────────────────────────
 # (condition_id, published_auc, alert_threshold, urgent_threshold)

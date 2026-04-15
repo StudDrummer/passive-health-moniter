@@ -37,7 +37,7 @@ def register_ml_routes(app, db_path: str, vigil_ml_dir: str):
     def _get_inference():
         nonlocal _inference
         if _inference is None:
-            import vigil_inference
+            import vigil_ml.vigil_inference as vigil_inference
             _inference = vigil_inference
         return _inference
 

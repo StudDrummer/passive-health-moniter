@@ -28,6 +28,9 @@ VIGIL_ML_DIR = os.path.expanduser("~/passive-health-moniter/vigil_ml")
 sys.path.insert(0, VIGIL_ML_DIR)
 from server_ml_patch import register_ml_routes
 
+app     = Flask(__name__)
+DB_PATH = os.path.expanduser("~/passive-health-moniter/vigil.db")
+
 # ── After app = Flask(__name__) ──────────────────────────────────────
 register_ml_routes(app, DB_PATH, VIGIL_ML_DIR)
 
