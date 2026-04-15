@@ -370,8 +370,9 @@ def run(db_path, dry_run=False, explain=False):
         has_ref = cid in REF
         personal_anomaly_score = iso          # "unusual for YOU"
         population_risk_score  = ref          # "resembles disease population"
-        combined = personal_anomaly_score     # trust this one more until you have real training data
-        s100 = round(combined*100, 1)
+        combined = personal_anomaly_score
+        prob = combined   
+        s100 = round(prob*100, 1)
 
         level="HIGH" if s100>=70 else "ELEVATED" if s100>=50 else "LOW"
         print(f"  [{level:8s}] {cond['label']:32s} score={s100:5.1f}/100  "
