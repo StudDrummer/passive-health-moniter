@@ -44,3 +44,5 @@ App.tsx.save
 VIGILApp/
 venv/
 EOFvigil_datasets/data/
+
+vigil_datasets/data/raw/
