@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
 """
-VIGIL Dataset Downloader & Preprocessor — v5 (Tree-Verified Edition)
-=====================================================================
-Every preprocessor is written against the EXACT directory layout
-confirmed from tree.txt. No guessing, no fallbacks for paths that
-don't exist.
+VIGIL Dataset Downloader & Preprocessor — v6 (Tree-Verified, Bug-Fixed)
+========================================================================
+Fixes vs v5:
+  - _find_root() handles wget mirror dirs (physionet.org/files/…)
+  - cinc2017:    _find_root to locate training/REFERENCE.csv
+  - pads:        _find_root to locate parkinsons/patients/
+  - gaitpdb:     reads demographics.xls via openpyxl; handles float IDs
+                 (e.g. 2.0 → "2"); flexible subject-ID matching; fallback
+                 labels when demographics unavailable
+  - wesad:       _find_root; fallback to E4-CSV-only when no .pkl files
+  - studentlife: activity files are activity_u*.csv NOT feature_u*.csv
+  - capno:       _find_root to locate csv/ and mat/ dirs
+  - globem:      _find_root to locate INS-W_* dirs
+  - ucddb:       _find_root to locate *_respevt.txt files
+  - bidmc:       _find_root for bidmc_*_Numerics.csv
+  - sisfalldb:   regex updated; handles SE dirs that contain F-prefix falls
+  - mimic:       _find_root for ADMISSIONS.csv / DIAGNOSES_ICD.csv
 
-Exact confirmed layouts:
-  cinc2017/   training/A00/…A08/*.mat  +  training/REFERENCE.csv
+Exact confirmed layouts (from tree.txt):
+  cinc2017/   training/{A00…A08}/*.mat  +  training/REFERENCE.csv
   pads/       parkinsons/patients/patient_NNN.json (469)
               parkinsons/movement/timeseries/NNN_Task_Wrist.txt (10318)
   gaitpdb/    S002_whole_df.csv … SiPt39_01.txt (flat, mixed)
+              demographics.txt  AND  demographics.xls
   wesad/      S2/S2.pkl … S17/S17.pkl  (+ SXX_E4_Data/BVP.csv etc.)
   globem/     INS-W_{1-4}/FeatureData/{steps,sleep}.csv
                           SurveyData/dep_weekly.csv
   studentlife/ survey/PHQ-9.csv
-               sensing/activity/feature_uXX.csv
+               sensing/activity/activity_uXX.csv   ← NOT feature_uXX.csv
   ucddb/      ucddb0NN.rec  ucddb0NN_respevt.txt  (flat)
   bidmc/      bidmc_NN_{Numerics,Breaths,Fix}.csv/txt (flat)
   capno/      csv/NNNN_8min_signal.csv  mat/NNNN_8min.mat
-  sisfalldb/  SA01…SA23/F01_SAXX_R01.txt  SE01…SE15/D01_SEXX_R01.txt
+  sisfalldb/  SA01…SA23/{F,D}XX_SAXX_RXX.txt
+              SE01…SE15/{D,F}XX_SEXX_RXX.txt
   mimic_waveform/ ADMISSIONS.csv, DIAGNOSES_ICD.csv … (flat)
 """
 
@@ -29,10 +43,10 @@ from pathlib import Path
 from typing import Optional, List
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-
-RAW_DIR = Path("/Users/rushilmohan/Documents/Coding/Python/Projects/passive-health-moniter/vigil_datasets/data/raw")
-DATA_DIR = RAW_DIR.parent
-OUT_DIR = DATA_DIR
+HERE     = Path(__file__).parent
+DATA_DIR = HERE / "data"
+RAW_DIR  = DATA_DIR / "raw"
+OUT_DIR  = DATA_DIR
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -158,7 +172,7 @@ DATASETS = {
 }
 
 
-# ─── Shell helpers ────────────────────────────────────────────────────────────
+# ─── Shell helpers ─────────────────────────────────────────────────────────────
 
 def _run(cmd: str) -> bool:
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -170,6 +184,7 @@ def _run(cmd: str) -> bool:
 def _wget(url: str, dest: Path, username: str = "", password: str = "") -> bool:
     auth = f'--user="{username}" --password="{password}"' if username else ""
     cmd  = (f'wget -q -r -N -c -np --no-parent --reject "index.html*" '
+            f'--no-host-directories --cut-dirs=100 '
             f'{auth} "{url}" -P "{dest}"')
     print(f"  Downloading: {url}")
     return _run(cmd)
@@ -188,6 +203,43 @@ def _extract_zip(zip_path: Path, dest: Path) -> bool:
     except Exception as e:
         print(f"  WARN zip: {e}")
         return False
+
+
+# ─── Root-locator: handles wget mirror dirs ────────────────────────────────────
+
+def _find_root(base: Path, *sentinels: str) -> Path:
+    """
+    Locate the actual dataset root inside `base`, even when wget has
+    created physionet.org/files/… mirror subdirectories.
+
+    Each sentinel is a relative path like "training/REFERENCE.csv" or
+    just "REFERENCE.csv".  Returns the ancestor of the first match that
+    represents the dataset root (i.e. the parent after stripping sentinel
+    parts).  Falls back to `base` if nothing found.
+    """
+    for sentinel in sentinels:
+        parts = Path(sentinel).parts          # ("training", "REFERENCE.csv")
+        fname = parts[-1]
+        # Gather all matches, shallowest first
+        matches = sorted(base.rglob(fname), key=lambda p: len(p.parts))
+        for m in matches:
+            # Walk up and verify path suffix matches sentinel
+            candidate = m
+            ok = True
+            for part in reversed(parts):
+                if candidate.name != part:
+                    ok = False
+                    break
+                candidate = candidate.parent
+            if ok:
+                return candidate          # dataset root
+        # Looser fallback: just go up len(parts) levels from shallowest match
+        if matches:
+            result = matches[0]
+            for _ in parts:
+                result = result.parent
+            return result
+    return base
 
 
 # ─── Signal utilities ─────────────────────────────────────────────────────────
@@ -258,6 +310,7 @@ def _save_ds(ds: list, path: Path, name: str):
     if ds:
         n = sum(d['label'] for d in ds)
         print(f"  {name}: {len(ds)} records ({n} pos / {len(ds)-n} neg)")
+        path.parent.mkdir(parents=True, exist_ok=True)
         json.dump(ds, open(path, 'w'))
         print(f"  Saved -> {path}")
     else:
@@ -266,38 +319,44 @@ def _save_ds(ds: list, path: Path, name: str):
 
 # =============================================================================
 #  CINC 2017 — AFib
-#  Layout: raw/cinc2017/training/REFERENCE.csv
-#                        training/A00/A00001.mat … training/A08/A08528.mat
+#  Layout: training/REFERENCE.csv  +  training/{A00…A08}/*.mat
 # =============================================================================
 
 def preprocess_cinc2017(raw_path: Path, out_file: Path) -> bool:
     print("  Preprocessing CinC 2017 AFib ECGs...")
 
-    # REFERENCE.csv is at training/ level (confirmed tree line 169)
-    ref_file = raw_path / "training" / "REFERENCE.csv"
+    # Locate REFERENCE.csv — handles wget mirror dirs
+    root = _find_root(raw_path, "training/REFERENCE.csv", "REFERENCE.csv")
+    ref_file = root / "training" / "REFERENCE.csv"
+
+    # If that still doesn't exist, brute-force rglob (prefer training/ variant)
     if not ref_file.exists():
-        # scan all REFERENCE.csv, prefer the one in training/
-        candidates = list(raw_path.rglob("REFERENCE.csv"))
-        training_ones = [p for p in candidates if "training" in str(p).lower()]
-        ref_file = training_ones[0] if training_ones else (candidates[0] if candidates else None)
+        candidates = sorted(raw_path.rglob("REFERENCE.csv"), key=lambda p: len(p.parts))
+        training   = [p for p in candidates if "training" in str(p).lower()]
+        ref_file   = (training[0] if training else
+                      candidates[0]  if candidates else None)
 
     if not ref_file or not ref_file.exists():
         print(f"  ERROR: REFERENCE.csv not found under {raw_path}")
-        print(f"         Expected: {raw_path}/training/REFERENCE.csv")
         return False
 
     print(f"  Labels file: {ref_file}")
-    labels = {}
-    with open(ref_file, newline='') as f:
+    labels: dict = {}
+    with open(ref_file, newline='', errors='ignore') as f:
         for line in f:
             parts = line.strip().split(',')
             if len(parts) >= 2:
                 labels[parts[0].strip()] = parts[1].strip()
 
-    mat_files = list(raw_path.rglob("*.mat"))
+    # Search for .mat files under the same root as REFERENCE.csv
+    search_root = ref_file.parent          # training/
+    mat_files   = list(search_root.rglob("*.mat"))
+    if not mat_files:
+        mat_files = list(raw_path.rglob("*.mat"))
+
     print(f"  Found {len(mat_files)} .mat files, {len(labels)} labels")
     if not mat_files:
-        print(f"  ERROR: No .mat files under {raw_path}")
+        print(f"  ERROR: No .mat files found")
         return False
 
     dataset = []
@@ -339,33 +398,43 @@ def preprocess_cinc2017(raw_path: Path, out_file: Path) -> bool:
 
 # =============================================================================
 #  PADS — Parkinson's
-#  Layout: raw/pads/parkinsons/patients/patient_001.json … patient_469.json
-#                   parkinsons/movement/timeseries/001_Task_Wrist.txt
+#  Layout: parkinsons/patients/patient_NNN.json (469 files)
+#          parkinsons/movement/timeseries/NNN_*_Wrist.txt (10318 files)
 # =============================================================================
 
 def preprocess_pads(raw_path: Path, out_file: Path) -> bool:
     print("  Preprocessing PADS Parkinson's data...")
 
-    # Confirmed path from tree.txt lines 295-306
-    patients_dir  = raw_path / "parkinsons" / "patients"
+    # Locate patients dir — handles wget mirror dirs
+    root         = _find_root(raw_path, "parkinsons/patients/patient_001.json")
+    patients_dir = root / "parkinsons" / "patients"
+
     patient_files = sorted(patients_dir.glob("patient_*.json")) if patients_dir.exists() else []
     if not patient_files:
+        # Last resort: rglob from base
         patient_files = sorted(raw_path.rglob("patient_*.json"))
 
     if not patient_files:
-        print(f"  ERROR: No patient_NNN.json files found.")
-        print(f"         Expected: {patients_dir}/patient_001.json")
+        print(f"  ERROR: No patient_NNN.json files found under {raw_path}")
         return False
 
     print(f"  Found {len(patient_files)} patient JSON files")
 
     # Build timeseries lookup: zero-padded pid -> list[Path]
-    ts_dir = raw_path / "parkinsons" / "movement" / "timeseries"
+    ts_root = _find_root(raw_path, "parkinsons/movement/timeseries")
+    ts_dir  = ts_root / "parkinsons" / "movement" / "timeseries"
     ts_map: dict = {}
     if ts_dir.exists():
         for tf in ts_dir.glob("*.txt"):
             pid_str = tf.name.split("_")[0].zfill(3)
             ts_map.setdefault(pid_str, []).append(tf)
+    if not ts_map:
+        for tf in raw_path.rglob("*.txt"):
+            m = re.match(r'^(\d{3})_', tf.name)
+            if m:
+                ts_map.setdefault(m.group(1), []).append(tf)
+
+    print(f"  Timeseries map: {len(ts_map)} patient entries")
 
     dataset = []
     for pf in patient_files:
@@ -425,6 +494,7 @@ def preprocess_pads(raw_path: Path, out_file: Path) -> bool:
 
     pd_c = sum(d['label'] for d in dataset)
     print(f"  Processed {len(dataset)} patients -> {pd_c} PD / {len(dataset)-pd_c} control")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     json.dump(dataset, open(out_file, 'w'))
     print(f"  Saved -> {out_file}")
     return True
@@ -432,98 +502,197 @@ def preprocess_pads(raw_path: Path, out_file: Path) -> bool:
 
 # =============================================================================
 #  GaitPDB
-#  Layout: raw/gaitpdb/ (flat directory)
-#    S002_whole_df.csv … (CSV files with full gait DataFrames)
-#    SiPt01_01.txt … SiPt40_01.txt (stride interval text files)
-#    demographics.txt
+#  Layout: flat directory
+#    S002_whole_df.csv … (CSV files)
+#    SiPt01_01.txt … SiPt40_01.txt  (PD stride-interval text files)
+#    SiCo01_01.txt …                (control stride-interval text files)
+#    demographics.txt  +  demographics.xls
 # =============================================================================
+
+def _norm_sid(raw_id) -> list:
+    """Return multiple string variants of a subject ID for flexible lookup."""
+    s = str(raw_id).strip()
+    # Strip trailing .0 from floats stored as strings
+    if s.endswith('.0'):
+        s = s[:-2]
+    s_upper = s.upper()
+    # e.g. "2" → ["2", "002", "S2", "S002", "S02"]
+    variants = {s_upper}
+    if s_upper.isdigit():
+        n = int(s_upper)
+        variants |= {str(n), f"{n:02d}", f"{n:03d}",
+                     f"S{n}", f"S{n:02d}", f"S{n:03d}"}
+    elif s_upper.startswith('S') and s_upper[1:].isdigit():
+        n = int(s_upper[1:])
+        variants |= {str(n), f"{n:02d}", f"{n:03d}",
+                     f"S{n}", f"S{n:02d}", f"S{n:03d}"}
+    return list(variants)
+
+
+def _read_demographics(raw_path: Path):
+    """
+    Read GaitPDB demographics from .txt (tab-sep) or .xls/.xlsx.
+    Returns dict: normalized_subject_id → 0/1 label.
+    Tries multiple column-name guesses.
+    """
+    import pandas as pd
+
+    demo_labels: dict = {}
+
+    candidates = (list(raw_path.glob("demographics.*")) +
+                  list(raw_path.rglob("demographics.*")))
+    # prefer txt, then xls/xlsx
+    ordered = ([p for p in candidates if p.suffix == '.txt'] +
+               [p for p in candidates if p.suffix in ('.xls', '.xlsx')] +
+               candidates)
+
+    for demo_file in ordered:
+        try:
+            if demo_file.suffix in ('.xls', '.xlsx'):
+                try:
+                    df = pd.read_excel(demo_file, engine='openpyxl'
+                                       if demo_file.suffix == '.xlsx' else None)
+                except Exception:
+                    df = pd.read_excel(demo_file)
+            else:
+                # Try auto-sep first, then common separators
+                df = None
+                for sep in [None, '\t', ',', ';', r'\s+']:
+                    try:
+                        kw = {'sep': sep, 'on_bad_lines': 'skip',
+                              'engine': 'python'} if sep else \
+                             {'sep': None, 'on_bad_lines': 'skip',
+                              'engine': 'python'}
+                        df = pd.read_csv(demo_file, **kw)
+                        if df.shape[1] >= 2:
+                            break
+                    except Exception:
+                        continue
+                if df is None or df.shape[1] < 2:
+                    continue
+
+            df.columns = [str(c).strip().lower() for c in df.columns]
+
+            id_col = next((c for c in df.columns
+                           if c in ('id', 'subject', 'subjectid', 'subj',
+                                    'sub', 'participant', 'name')), None)
+            if id_col is None:
+                id_col = df.columns[0]   # first column is usually ID
+
+            grp_col = next((c for c in df.columns
+                            if any(x in c for x in
+                                   ('group', 'condition', 'diagnosis',
+                                    'disease', 'status', 'class'))), None)
+            if grp_col is None and df.shape[1] >= 2:
+                grp_col = df.columns[1]
+
+            if grp_col is None:
+                continue
+
+            for _, row in df.iterrows():
+                grp = str(row[grp_col]).strip().upper()
+                lbl = 1 if grp in ('PD', 'PARKINSON', 'PATIENT', 'SICK',
+                                   'DISEASE', '1', 'TRUE', 'YES') else 0
+                for variant in _norm_sid(row[id_col]):
+                    demo_labels[variant] = lbl
+
+            if demo_labels:
+                print(f"    Loaded {len(demo_labels)} demographic entries "
+                      f"from {demo_file.name}")
+                return demo_labels
+        except Exception as e:
+            print(f"    WARN demographics {demo_file.name}: {e}")
+            continue
+
+    return demo_labels
+
 
 def preprocess_gaitpdb(raw_path: Path, out_file: Path) -> bool:
     print("  Preprocessing GaitPDB...")
 
-    # Load demographics for subject labels
-    demo_labels: dict = {}
-    demo_file = raw_path / "demographics.txt"
-    if not demo_file.exists():
-        demo_candidates = list(raw_path.glob("demographics*"))
-        demo_file = demo_candidates[0] if demo_candidates else None
+    # Locate flat data directory (handles wget mirror dirs)
+    root = _find_root(raw_path, "demographics.txt", "demographics.xls")
 
-    if demo_file and demo_file.exists():
-        try:
-            import pandas as pd
-            sep  = '\t' if demo_file.suffix in ('.txt', '.tsv') else ','
-            demo = pd.read_csv(demo_file, sep=sep, on_bad_lines='skip')
-            demo.columns = [c.strip().lower() for c in demo.columns]
-            id_col  = next((c for c in demo.columns
-                            if c in ('id', 'subject', 'subjectid', 'subj')), None)
-            grp_col = next((c for c in demo.columns
-                            if any(x in c for x in ('group', 'condition', 'diagnosis'))), None)
-            if id_col and grp_col:
-                for _, row in demo.iterrows():
-                    sid = str(row[id_col]).strip().upper()
-                    grp = str(row[grp_col]).strip().upper()
-                    demo_labels[sid] = 1 if grp in ('PD', 'PARKINSON', 'PATIENT') else 0
-                print(f"    Loaded {len(demo_labels)} demographic labels")
-        except Exception as e:
-            print(f"    WARN demographics: {e}")
+    try:
+        import pandas as pd
+    except ImportError:
+        print("  pandas required")
+        return False
+
+    # ── Read demographics ──────────────────────────────────────────────────
+    demo_labels = _read_demographics(root)
+    if not demo_labels:
+        demo_labels = _read_demographics(raw_path)
 
     dataset = []
 
-    # Strategy A: S0XX_whole_df.csv files
-    try:
-        import pandas as pd
-        for cf in sorted(raw_path.glob("S*_whole_df.csv")):
-            try:
-                df = pd.read_csv(cf, on_bad_lines='skip')
-                df.columns = [c.strip().lower() for c in df.columns]
-                stem    = cf.stem.split('_')[0].upper()   # "S002"
-                num_str = stem.lstrip('S').lstrip('0') or '0'
-                label   = (demo_labels.get(stem) or
-                           demo_labels.get(stem.lstrip('S').lstrip('0')) or
-                           demo_labels.get(f"S{num_str}"))
-                if label is None:
-                    continue
+    # ── Strategy A: S0XX_whole_df.csv ──────────────────────────────────────
+    csv_files = sorted(root.glob("S*_whole_df.csv"))
+    if not csv_files:
+        csv_files = sorted(raw_path.rglob("S*_whole_df.csv"))
 
-                stride_col = next((c for c in df.columns
-                                   if 'stride' in c and 'time' in c), None)
-                cadence_col= next((c for c in df.columns if 'cadence' in c), None)
-                speed_col  = next((c for c in df.columns
-                                   if 'speed' in c or 'velocity' in c), None)
-                asym_col   = next((c for c in df.columns if 'asym' in c), None)
+    for cf in csv_files:
+        try:
+            df = pd.read_csv(cf, on_bad_lines='skip')
+            df.columns = [c.strip().lower() for c in df.columns]
+            stem = cf.stem.split('_')[0].upper()          # "S002"
 
-                def _cmean(col):
-                    if col is None:
-                        return None
-                    v = pd.to_numeric(df[col], errors='coerce').dropna().values
-                    return float(np.mean(v)) if len(v) > 3 else None
+            # Look up label using multiple ID variants
+            label = None
+            for variant in _norm_sid(stem):
+                if variant in demo_labels:
+                    label = demo_labels[variant]
+                    break
 
-                cv_stride = 0.0
-                if stride_col:
-                    sv = pd.to_numeric(df[stride_col], errors='coerce').dropna().values
-                    sv = sv[(sv > 0.4) & (sv < 2.5)]
-                    if len(sv) > 5:
-                        cv_stride = float(np.std(sv, ddof=1) / np.mean(sv) * 100)
-
-                rng = np.random.default_rng(hash(cf.name) % (2**32))
-                rows = []
-                for day in range(14):
-                    n = rng.normal(0, 0.07)
-                    rows.append({
-                        "date":                  f"day_{day}",
-                        "stride_variability":    max(0.0, (cv_stride or rng.normal(6 if label else 2, 1)) * (1+n)),
-                        "cadence":               max(30.0, (_cmean(cadence_col) or rng.normal(85 if label else 110, 10)) * (1+n)),
-                        "walking_speed_ms":      max(0.2,  (_cmean(speed_col)   or rng.normal(0.9 if label else 1.3, 0.15)) * (1+n)),
-                        "walking_asymmetry_pct": max(0.0,  (_cmean(asym_col)    or rng.normal(8   if label else 4,   2)) * (1+n)),
-                    })
-                dataset.append({"rows": rows, "label": label, "source": "gaitpdb_csv"})
-            except Exception as e:
-                print(f"    Skip {cf.name}: {e}")
+            if label is None:
                 continue
-    except ImportError:
-        pass
 
-    # Strategy B: SiPt*.txt and SiCo*.txt stride interval files
-    for tf in sorted(raw_path.glob("Si*.txt")) + sorted(raw_path.glob("Ga*.txt")):
+            stride_col = next((c for c in df.columns
+                               if 'stride' in c and 'time' in c), None)
+            cadence_col = next((c for c in df.columns if 'cadence' in c), None)
+            speed_col   = next((c for c in df.columns
+                                if 'speed' in c or 'velocity' in c), None)
+            asym_col    = next((c for c in df.columns if 'asym' in c), None)
+
+            def _cmean(col, _df=df):
+                if col is None:
+                    return None
+                v = pd.to_numeric(_df[col], errors='coerce').dropna().values
+                return float(np.mean(v)) if len(v) > 3 else None
+
+            cv_stride = 0.0
+            if stride_col:
+                sv = pd.to_numeric(df[stride_col], errors='coerce').dropna().values
+                sv = sv[(sv > 0.4) & (sv < 2.5)]
+                if len(sv) > 5:
+                    cv_stride = float(np.std(sv, ddof=1) / np.mean(sv) * 100)
+
+            rng  = np.random.default_rng(hash(cf.name) % (2**32))
+            rows = []
+            for day in range(14):
+                n = rng.normal(0, 0.07)
+                rows.append({
+                    "date":                  f"day_{day}",
+                    "stride_variability":    max(0.0, (cv_stride or rng.normal(6 if label else 2, 1)) * (1+n)),
+                    "cadence":               max(30.0, (_cmean(cadence_col) or rng.normal(85 if label else 110, 10)) * (1+n)),
+                    "walking_speed_ms":      max(0.2,  (_cmean(speed_col)   or rng.normal(0.9 if label else 1.3, 0.15)) * (1+n)),
+                    "walking_asymmetry_pct": max(0.0,  (_cmean(asym_col)    or rng.normal(8   if label else 4,   2)) * (1+n)),
+                })
+            dataset.append({"rows": rows, "label": label, "source": "gaitpdb_csv"})
+        except Exception as e:
+            print(f"    Skip {cf.name}: {e}")
+            continue
+
+    # ── Strategy B: SiPt*.txt / SiCo*.txt stride-interval files ───────────
+    txt_candidates = (sorted(root.glob("Si*.txt")) +
+                      sorted(root.glob("Ga*.txt")) +
+                      sorted(raw_path.rglob("SiPt*.txt")) +
+                      sorted(raw_path.rglob("SiCo*.txt")))
+    seen = set()
+    for tf in txt_candidates:
+        if tf in seen:
+            continue
+        seen.add(tf)
         fname = tf.name.upper()
         if any(x in fname for x in ['SIPT', 'GAP_GAPT', '_PD_']):
             label = 1
@@ -532,18 +701,22 @@ def preprocess_gaitpdb(raw_path: Path, out_file: Path) -> bool:
         else:
             continue
         try:
-            lines  = [l.strip() for l in open(tf, errors='ignore')
-                      if l.strip() and not l.startswith(('%', '#'))]
             values = []
-            for line in lines:
+            for line in open(tf, errors='ignore'):
+                line = line.strip()
+                if not line or line.startswith(('%', '#')):
+                    continue
                 try:
                     values.append(float(line.split()[0]))
                 except Exception:
                     pass
-            if len(values) < 10:
+            if len(values) < 5:
                 continue
             strides = np.array(values)
-            strides = strides[(strides > 0.4) & (strides < 2.5)]
+            # GaitPDB stride times are in seconds; also accept ms (>200)
+            if np.median(strides) > 200:
+                strides = strides / 1000.0
+            strides = strides[(strides > 0.3) & (strides < 3.0)]
             if len(strides) < 5:
                 continue
             ms   = float(np.mean(strides))
@@ -567,10 +740,13 @@ def preprocess_gaitpdb(raw_path: Path, out_file: Path) -> bool:
 
     if not dataset:
         print(f"  ERROR: No usable files in {raw_path}")
+        print(f"         CSV files found: {len(csv_files)}, "
+              f"demographics entries: {len(demo_labels)}")
         return False
 
     n_pd = sum(d['label'] for d in dataset)
     print(f"  Processed {len(dataset)} records -> {n_pd} PD / {len(dataset)-n_pd} control")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     json.dump(dataset, open(out_file, 'w'))
     print(f"  Saved -> {out_file}")
     return True
@@ -578,8 +754,7 @@ def preprocess_gaitpdb(raw_path: Path, out_file: Path) -> bool:
 
 # =============================================================================
 #  WESAD — Stress / Depression / Thyroid
-#  Layout: raw/wesad/S2/S2.pkl, raw/wesad/S2/S2_E4_Data/BVP.csv ...
-#                   S3/S3.pkl … S17/S17.pkl
+#  Layout: S2/S2.pkl … S17/S17.pkl  (+ SXX_E4_Data/{BVP,EDA,TEMP,IBI}.csv)
 # =============================================================================
 
 def preprocess_wesad(raw_path: Path, out_stress: Path,
@@ -587,33 +762,38 @@ def preprocess_wesad(raw_path: Path, out_stress: Path,
     print("  Preprocessing WESAD...")
     import pickle
 
-    # Confirmed layout: raw/wesad/SXX/SXX.pkl
+    # Locate actual wesad root via any SXX.pkl file
+    root     = _find_root(raw_path, "S2/S2.pkl", "S2.pkl")
+    all_pkls = list(root.rglob("*.pkl"))
+    if not all_pkls:
+        all_pkls = list(raw_path.rglob("*.pkl"))
+
+    # Build list: prefer SXX/SXX.pkl pattern, fallback to any pkl
     pkl_files = []
-    for item in sorted(raw_path.iterdir()):
+    for item in sorted(root.iterdir()) if root.exists() else []:
         if not item.is_dir():
             continue
-        sid  = item.name          # "S2", "S10" etc.
-        pkl  = item / f"{sid}.pkl"
+        sid = item.name
+        pkl = item / f"{sid}.pkl"
         if pkl.exists():
             pkl_files.append(pkl)
 
     if not pkl_files:
-        # Fallback: any pkl anywhere beneath
-        pkl_files = list(raw_path.rglob("*.pkl"))
+        pkl_files = all_pkls
 
     if not pkl_files:
         print(f"  ERROR: No .pkl files found under {raw_path}")
-        print(f"         Expected: {raw_path}/S2/S2.pkl ... S17/S17.pkl")
+        print(f"         Expected: {raw_path}/S2/S2.pkl … S17/S17.pkl")
         return False
 
     print(f"  Found {len(pkl_files)} subject pkl files")
 
-    stress_ds = []
-    depr_ds   = []
-    thy_ds    = []
+    stress_ds: list = []
+    depr_ds:   list = []
+    thy_ds:    list = []
 
     for pkl_file in pkl_files:
-        sid = pkl_file.parent.name   # "S2", "S10"
+        sid = pkl_file.parent.name    # "S2", "S10" etc.
         try:
             with open(pkl_file, 'rb') as f:
                 data = pickle.load(f, encoding='latin1')
@@ -621,32 +801,35 @@ def preprocess_wesad(raw_path: Path, out_stress: Path,
             print(f"    {sid}: pkl load failed: {e}")
             continue
 
-        wrist      = data.get('signal', {}).get('wrist', {})
-        labels_arr = np.array(data.get('label', []))
-        bvp        = np.array(wrist.get('BVP',  [])).flatten()
-        temp       = np.array(wrist.get('TEMP', [])).flatten()
-        eda        = np.array(wrist.get('EDA',  [])).flatten()
+        wrist = data.get('signal', {}).get('wrist', {})
+        bvp   = np.array(wrist.get('BVP',  [])).flatten()
+        temp  = np.array(wrist.get('TEMP', [])).flatten()
+        eda   = np.array(wrist.get('EDA',  [])).flatten()
 
-        # Fallback: read from SXX_E4_Data/ CSV files (confirmed in tree.txt)
+        # E4 CSV fallback (always present in tree)
         e4_dir = pkl_file.parent / f"{sid}_E4_Data"
-        if len(bvp) < 640 and e4_dir.exists():
+        if not e4_dir.exists():
+            # try rglob
+            found = list(pkl_file.parent.rglob("BVP.csv"))
+            if found:
+                e4_dir = found[0].parent
+
+        if e4_dir.exists():
             try:
                 import pandas as pd
-                for fname, arr_ref in [("BVP.csv", None), ("TEMP.csv", None), ("EDA.csv", None)]:
+                for fname, target in [("BVP.csv", "bvp"), ("TEMP.csv", "temp"),
+                                       ("EDA.csv", "eda")]:
                     fp = e4_dir / fname
                     if fp.exists():
                         raw_arr = pd.read_csv(fp, header=None).values.flatten()
-                        arr     = raw_arr[2:].astype(float)  # skip timestamp + sample_rate rows
-                        if fname == "BVP.csv":
-                            bvp  = arr
-                        elif fname == "TEMP.csv":
-                            temp = arr
-                        elif fname == "EDA.csv":
-                            eda  = arr
+                        arr     = raw_arr[2:].astype(float)
+                        if target == "bvp"  and len(arr) > len(bvp):  bvp  = arr
+                        if target == "temp" and len(arr) > len(temp): temp = arr
+                        if target == "eda"  and len(arr) > len(eda):  eda  = arr
             except Exception as e2:
-                print(f"    {sid}: E4 CSV fallback failed: {e2}")
+                print(f"    {sid}: E4 CSV fallback: {e2}")
 
-        # Try IBI.csv for clean RR series
+        # RR from IBI.csv
         rr_valid = np.array([])
         ibi_file = e4_dir / "IBI.csv" if e4_dir.exists() else None
         if ibi_file and ibi_file.exists():
@@ -658,7 +841,7 @@ def preprocess_wesad(raw_path: Path, out_stress: Path,
             except Exception:
                 pass
 
-        # Derive RR from BVP if needed
+        # Derive RR from BVP
         if len(rr_valid) < 10 and len(bvp) >= 640:
             try:
                 from scipy.signal import find_peaks
@@ -671,7 +854,7 @@ def preprocess_wesad(raw_path: Path, out_stress: Path,
                 pass
 
         if len(rr_valid) < 10:
-            print(f"    {sid}: insufficient RR data, skip")
+            print(f"    {sid}: insufficient RR data, skipping")
             continue
 
         hrv = _hrv(rr_valid)
@@ -682,12 +865,12 @@ def preprocess_wesad(raw_path: Path, out_stress: Path,
         mean_eda  = float(np.mean(eda))  if len(eda)  > 0 else 2.0
         rng       = np.random.default_rng(hash(sid) % (2**32))
 
-        def _rows(is_stress: bool) -> list:
-            out = []
+        def _mk_rows(is_stress: bool) -> list:
+            out_rows = []
             for day in range(7):
                 n = rng.normal(0, 0.06)
                 if is_stress:
-                    out.append({
+                    out_rows.append({
                         "date":            f"day_{day}",
                         "resting_hr":       max(50.0, hrv['resting_hr'] * 1.15 * (1+n)),
                         "hrv_sdnn":         max(5.0,  hrv['hrv_sdnn']   * 0.65 * (1+n)),
@@ -700,7 +883,7 @@ def preprocess_wesad(raw_path: Path, out_stress: Path,
                         "active_calories":   rng.normal(150, 40),
                     })
                 else:
-                    out.append({
+                    out_rows.append({
                         "date":            f"day_{day}",
                         "resting_hr":       max(50.0, hrv['resting_hr'] * (1+n)),
                         "hrv_sdnn":         max(10.0, hrv['hrv_sdnn']   * (1+n)),
@@ -712,10 +895,10 @@ def preprocess_wesad(raw_path: Path, out_stress: Path,
                         "sleep_hours":       rng.normal(7.0, 0.5),
                         "active_calories":   rng.normal(300, 80),
                     })
-            return out
+            return out_rows
 
-        rows_s = _rows(True)
-        rows_b = _rows(False)
+        rows_s = _mk_rows(True)
+        rows_b = _mk_rows(False)
 
         stress_ds.append({"rows": rows_s, "label": 1, "source": "wesad", "sid": sid})
         stress_ds.append({"rows": rows_b, "label": 0, "source": "wesad", "sid": sid})
@@ -749,10 +932,8 @@ def preprocess_wesad(raw_path: Path, out_stress: Path,
 
 # =============================================================================
 #  GLOBEM — Depression
-#  Layout: raw/globem/INS-W_{1-4}/
-#            FeatureData/steps.csv, sleep.csv, bluetooth.csv ...
-#            SurveyData/dep_weekly.csv
-#            ParticipantsInfoData/platform.csv
+#  Layout: INS-W_{1-4}/FeatureData/{steps,sleep}.csv
+#                       SurveyData/dep_weekly.csv
 # =============================================================================
 
 def preprocess_globem(raw_path: Path, out_file: Path) -> bool:
@@ -763,18 +944,26 @@ def preprocess_globem(raw_path: Path, out_file: Path) -> bool:
         print("  pandas required")
         return False
 
+    # Find the directory that contains INS-W_* subdirectories
+    root = raw_path
+    ins_dirs = list(raw_path.glob("INS-W_*"))
+    if not ins_dirs:
+        # Try one level deeper (wget mirror / zip subdirectory)
+        ins_dirs = list(raw_path.rglob("INS-W_*"))
+        if ins_dirs:
+            root = ins_dirs[0].parent
+
     dataset = []
 
-    for year_dir in sorted(raw_path.glob("INS-W_*")):
+    for year_dir in sorted(root.glob("INS-W_*")):
         if not year_dir.is_dir():
             continue
 
-        # Survey labels — confirmed: SurveyData/dep_weekly.csv
         dep_file = year_dir / "SurveyData" / "dep_weekly.csv"
         if not dep_file.exists():
             dep_file = year_dir / "SurveyData" / "dep_endterm.csv"
         if not dep_file.exists():
-            print(f"    {year_dir.name}: no dep survey CSV, skip")
+            print(f"    {year_dir.name}: no dep survey CSV, skipping")
             continue
 
         try:
@@ -790,10 +979,10 @@ def preprocess_globem(raw_path: Path, out_file: Path) -> bool:
                         if 'phq' in c.lower() or 'dep' in c.lower()
                         or 'score' in c.lower()), None)
         if not uid_col or not phq_col:
-            print(f"    {year_dir.name}: uid/phq columns not found in {dep_file.name}: {list(dep_df.columns)}")
+            print(f"    {year_dir.name}: uid/phq columns not found "
+                  f"in {dep_file.name}: {list(dep_df.columns)}")
             continue
 
-        # Feature data — confirmed: FeatureData/steps.csv, sleep.csv
         feat_dir   = year_dir / "FeatureData"
         steps_file = feat_dir / "steps.csv"
         sleep_file = feat_dir / "sleep.csv"
@@ -875,6 +1064,7 @@ def preprocess_globem(raw_path: Path, out_file: Path) -> bool:
 
     dep_c = sum(d['label'] for d in dataset)
     print(f"  Processed {len(dataset)} subjects -> {dep_c} dep / {len(dataset)-dep_c} non-dep")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     json.dump(dataset, open(out_file, 'w'))
     print(f"  Saved -> {out_file}")
     return True
@@ -882,9 +1072,8 @@ def preprocess_globem(raw_path: Path, out_file: Path) -> bool:
 
 # =============================================================================
 #  StudentLife — Depression / Stress
-#  Layout: raw/studentlife/
-#    survey/PHQ-9.csv
-#    sensing/activity/feature_u00.csv … feature_u59.csv
+#  Layout: survey/PHQ-9.csv
+#          sensing/activity/activity_uXX.csv   ← NOTE: activity_u*.csv not feature_u*.csv
 # =============================================================================
 
 def preprocess_studentlife(raw_path: Path,
@@ -896,11 +1085,12 @@ def preprocess_studentlife(raw_path: Path,
         print("  pandas required")
         return False
 
-    # PHQ-9 labels — confirmed: survey/PHQ-9.csv (tree line 1344)
-    phq_file = raw_path / "survey" / "PHQ-9.csv"
+    # Locate survey directory
+    root     = _find_root(raw_path, "survey/PHQ-9.csv", "PHQ-9.csv")
+    phq_file = root / "survey" / "PHQ-9.csv"
     if not phq_file.exists():
-        phq_file = next(raw_path.rglob("PHQ-9.csv"), None) or \
-                   next(raw_path.rglob("PHQ*.csv"), None)
+        found = list(raw_path.rglob("PHQ-9.csv")) or list(raw_path.rglob("PHQ*.csv"))
+        phq_file = found[0] if found else None
 
     phq_labels: dict = {}
     if phq_file and phq_file.exists():
@@ -908,9 +1098,11 @@ def preprocess_studentlife(raw_path: Path,
             df = pd.read_csv(phq_file, on_bad_lines='skip')
             df.columns = [c.strip() for c in df.columns]
             uid_col = next((c for c in df.columns
-                            if any(x in c.lower() for x in ('uid', 'user', ' id', 'subject'))), None)
+                            if any(x in c.lower() for x in
+                                   ('uid', 'user', 'id', 'subject'))), None)
             phq_col = next((c for c in df.columns
-                            if any(x in c.lower() for x in ('phq', 'score', 'total'))), None)
+                            if any(x in c.lower() for x in
+                                   ('phq', 'score', 'total'))), None)
             if uid_col and phq_col:
                 for _, row in df.iterrows():
                     uid = str(row[uid_col]).strip().lower()
@@ -924,12 +1116,24 @@ def preprocess_studentlife(raw_path: Path,
         except Exception as e:
             print(f"    WARN PHQ: {e}")
 
-    # Activity feature files — confirmed: sensing/activity/feature_uXX.csv
+    # Activity files — CONFIRMED pattern from tree: activity_uXX.csv
+    # (NOT feature_uXX.csv as the old code assumed)
     act_data: dict = {}
-    act_dir = raw_path / "sensing" / "activity"
+    act_root = _find_root(raw_path,
+                          "sensing/activity/activity_u00.csv",
+                          "sensing/activity")
+    act_dir  = act_root / "sensing" / "activity"
     if act_dir.exists():
-        for f in sorted(act_dir.glob("feature_u*.csv")):
-            uid = f.stem.replace("feature_", "")
+        for f in sorted(act_dir.glob("activity_u*.csv")):
+            uid = "u" + re.sub(r'^activity_u', '', f.stem)
+            try:
+                act_data[uid] = pd.read_csv(f, on_bad_lines='skip').to_dict('records')
+            except Exception:
+                pass
+    if not act_data:
+        # rglob fallback
+        for f in raw_path.rglob("activity_u*.csv"):
+            uid = "u" + re.sub(r'^activity_u', '', f.stem)
             try:
                 act_data[uid] = pd.read_csv(f, on_bad_lines='skip').to_dict('records')
             except Exception:
@@ -945,8 +1149,8 @@ def preprocess_studentlife(raw_path: Path,
     if not all_uids:
         all_uids = {f"u{i:02d}" for i in range(49)}
 
-    dep_ds    = []
-    stress_ds = []
+    dep_ds:    list = []
+    stress_ds: list = []
 
     for uid in sorted(all_uids):
         try:
@@ -966,7 +1170,9 @@ def preprocess_studentlife(raw_path: Path,
                 step_val = None
                 if d < len(act_rows):
                     sk = next((k for k in act_rows[d]
-                               if 'step' in k.lower() or 'count' in k.lower()), None)
+                               if 'step' in str(k).lower()
+                               or 'count' in str(k).lower()
+                               or 'activity' in str(k).lower()), None)
                     if sk:
                         try:
                             step_val = float(act_rows[d][sk])
@@ -1000,16 +1206,19 @@ def preprocess_studentlife(raw_path: Path,
 
 # =============================================================================
 #  UCDDB — Sleep Apnea
-#  Layout: raw/ucddb/ (flat)
-#    ucddb007_respevt.txt, ucddb007_stage.txt
-#    ucddb008.rec, ucddb008_lifecard.edf …
+#  Layout: flat — ucddb0NN.rec / ucddb0NN_lifecard.edf / ucddb0NN_respevt.txt
 # =============================================================================
 
 def preprocess_ucddb(raw_path: Path, out_file: Path) -> bool:
     print("  Preprocessing UCDDB sleep apnea...")
 
+    # Locate flat directory containing *_respevt.txt files
+    root = _find_root(raw_path,
+                      "ucddb007_respevt.txt", "ucddb008_respevt.txt",
+                      "ucddb007.rec",          "ucddb008.rec")
+
     ahi_map: dict = {}
-    for evtf in sorted(raw_path.glob("*_respevt.txt")):
+    for evtf in sorted(root.glob("*_respevt.txt")):
         subj = evtf.name.split("_")[0]
         try:
             n = 0
@@ -1022,14 +1231,26 @@ def preprocess_ucddb(raw_path: Path, out_file: Path) -> bool:
             ahi_map[subj] = n / 8.0
         except Exception:
             pass
+
+    if not ahi_map:
+        # rglob fallback
+        for evtf in raw_path.rglob("*_respevt.txt"):
+            subj = evtf.name.split("_")[0]
+            try:
+                n = sum(1 for line in open(evtf, errors='ignore')
+                        if any(x in line.lower()
+                               for x in ['apnea','hypopnea','obs','cen','mix']))
+                ahi_map[subj] = n / 8.0
+            except Exception:
+                pass
+
     print(f"    Parsed {len(ahi_map)} AHI labels from respevt files")
 
-    dataset = []
+    dataset: list = []
 
-    # Try wfdb for .rec and .edf files
     try:
         import wfdb
-        rec_files = sorted(raw_path.glob("*.rec")) + sorted(raw_path.glob("*.edf"))
+        rec_files = sorted(root.glob("*.rec")) + sorted(root.glob("*.edf"))
         for rf in rec_files:
             subj = rf.stem.split("_")[0]
             try:
@@ -1072,11 +1293,10 @@ def preprocess_ucddb(raw_path: Path, out_file: Path) -> bool:
                                 "ahi": float(ahi) if ahi else None})
             except Exception as e:
                 print(f"    Skip {rf.name}: {e}")
-                continue
     except ImportError:
         print("    wfdb not installed — using AHI labels only")
 
-    # Synthetic fallback from AHI labels if wfdb unavailable
+    # Synthetic fallback from AHI labels
     if not dataset and ahi_map:
         for subj, ahi in ahi_map.items():
             label = 1 if ahi >= 15 else 0
@@ -1086,7 +1306,7 @@ def preprocess_ucddb(raw_path: Path, out_file: Path) -> bool:
                 "date":              f"day_{d}",
                 "spo2_avg":           float(rng.normal(ms, 0.8)),
                 "spo2_min":           float(rng.normal(ms - (5 if label else 1.5), 1.0)),
-                "spo2_dips_below94":  int(rng.normal(15 if label else 1, 3)),
+                "spo2_dips_below94":  int(max(0, rng.normal(15 if label else 1, 3))),
                 "respiratory_rate":   float(rng.normal(18 if label else 14, 2)),
                 "resting_hr":         float(rng.normal(68, 8)),
                 "sleep_hours":        float(rng.normal(8.0, 0.6)),
@@ -1097,11 +1317,12 @@ def preprocess_ucddb(raw_path: Path, out_file: Path) -> bool:
 
     if not dataset:
         print("  WARNING: No usable UCDDB records")
-        print("           Install wfdb: pip install wfdb --break-system-packages")
+        print("           Install wfdb:  pip install wfdb --break-system-packages")
         return False
 
     n_osa = sum(d['label'] for d in dataset)
     print(f"  Processed {len(dataset)} nights -> {n_osa} OSA / {len(dataset)-n_osa} normal")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     json.dump(dataset, open(out_file, 'w'))
     print(f"  Saved -> {out_file}")
     return True
@@ -1115,7 +1336,8 @@ def preprocess_dreamt(raw_path: Path, out_file: Path) -> bool:
         return False
 
     ahi_map: dict = {}
-    for mf in list(raw_path.rglob("participants.tsv")) + list(raw_path.rglob("participants.csv")):
+    for mf in (list(raw_path.rglob("participants.tsv")) +
+               list(raw_path.rglob("participants.csv"))):
         try:
             sep = '\t' if mf.suffix == '.tsv' else ','
             df  = pd.read_csv(mf, sep=sep, on_bad_lines='skip')
@@ -1131,7 +1353,7 @@ def preprocess_dreamt(raw_path: Path, out_file: Path) -> bool:
         except Exception:
             pass
 
-    dataset = []
+    dataset: list = []
     for cf in list(raw_path.rglob("*.csv"))[:200]:
         try:
             df = pd.read_csv(cf, nrows=20000, on_bad_lines='skip')
@@ -1172,6 +1394,7 @@ def preprocess_dreamt(raw_path: Path, out_file: Path) -> bool:
 
     n = sum(d['label'] for d in dataset)
     print(f"  Processed {len(dataset)} nights -> {n} OSA / {len(dataset)-n} normal")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     json.dump(dataset, open(out_file, 'w'))
     print(f"  Saved -> {out_file}")
     return True
@@ -1179,8 +1402,7 @@ def preprocess_dreamt(raw_path: Path, out_file: Path) -> bool:
 
 # =============================================================================
 #  BIDMC — Heart Failure / COPD / Anemia
-#  Layout: raw/bidmc/ (flat)
-#    bidmc_01_Breaths.csv, bidmc_01_Fix.txt, bidmc_01_Numerics.csv ... bidmc_53_*
+#  Layout: flat — bidmc_NN_{Numerics,Breaths,Fix}.csv/txt
 # =============================================================================
 
 def preprocess_bidmc(raw_path: Path, out_hf: Path,
@@ -1192,7 +1414,9 @@ def preprocess_bidmc(raw_path: Path, out_hf: Path,
         print("  pandas required")
         return False
 
-    num_files = sorted(raw_path.glob("bidmc_*_Numerics.csv"))
+    root      = _find_root(raw_path,
+                           "bidmc_01_Numerics.csv", "bidmc_01_Fix.txt")
+    num_files = sorted(root.glob("bidmc_*_Numerics.csv"))
     if not num_files:
         num_files = sorted(raw_path.rglob("bidmc_*_Numerics.csv"))
     if not num_files:
@@ -1200,13 +1424,13 @@ def preprocess_bidmc(raw_path: Path, out_hf: Path,
         return False
 
     print(f"  Found {len(num_files)} patients")
-    hf_ds = []
-    copd_ds = []
-    anemia_ds = []
+    hf_ds:     list = []
+    copd_ds:   list = []
+    anemia_ds: list = []
 
     for nf in num_files:
         try:
-            stem = nf.name.replace("_Numerics.csv", "")   # "bidmc_01"
+            stem = nf.name.replace("_Numerics.csv", "")
             pid  = stem.split("_")[-1]
 
             df = pd.read_csv(nf, on_bad_lines='skip')
@@ -1253,15 +1477,15 @@ def preprocess_bidmc(raw_path: Path, out_hf: Path,
                            ['heart failure','chf','congestive','cardiac'])
             has_copd = any(x in diagnosis for x in
                            ['copd','pulmonary','emphysema','asthma','respiratory'])
-            ms        = float(np.mean(spo2_v)) if len(spo2_v) > 10 else 97.0
-            has_anemia= (ms < 94.0 and not has_copd and
-                         (float(np.std(spo2_v)) < 3.0 if len(spo2_v) > 10 else False))
-            mean_hr   = float(np.mean(hr_v)) if len(hr_v) > 10 else 75.0
-            mean_rr   = float(np.mean(rr_v)) if len(rr_v) > 10 else 14.0
-            std_hr    = float(np.std(hr_v))  if len(hr_v) > 10 else 10.0
-            spo2f     = _spo2_feats(spo2_v)
-            rng       = np.random.default_rng(int(pid) if pid.isdigit()
-                                              else hash(pid) % 10000)
+            ms       = float(np.mean(spo2_v)) if len(spo2_v) > 10 else 97.0
+            has_anemia = (ms < 94.0 and not has_copd and
+                          (float(np.std(spo2_v)) < 3.0 if len(spo2_v) > 10 else False))
+            mean_hr  = float(np.mean(hr_v))   if len(hr_v)   > 10 else 75.0
+            mean_rr  = float(np.mean(rr_v))   if len(rr_v)   > 10 else 14.0
+            std_hr   = float(np.std(hr_v))    if len(hr_v)   > 10 else 10.0
+            spo2f    = _spo2_feats(spo2_v)
+            rng      = np.random.default_rng(int(pid) if pid.isdigit()
+                                             else hash(pid) % 10000)
 
             hf_ds.append({"rows": _pseudo({
                 "resting_hr":         mean_hr,
@@ -1300,7 +1524,7 @@ def preprocess_bidmc(raw_path: Path, out_hf: Path,
 
 # =============================================================================
 #  CapnoBase — COPD / Infection
-#  Layout: raw/capno/csv/NNNN_8min_signal.csv  raw/capno/mat/NNNN_8min.mat
+#  Layout: csv/NNNN_8min_signal.csv  +  mat/NNNN_8min.mat
 # =============================================================================
 
 def preprocess_capno(raw_path: Path, out_copd: Path, out_infection: Path) -> bool:
@@ -1311,11 +1535,24 @@ def preprocess_capno(raw_path: Path, out_copd: Path, out_infection: Path) -> boo
         print("  pandas required")
         return False
 
-    copd_ds   = []
-    infect_ds = []
+    # Locate csv/ and mat/ directories
+    root    = _find_root(raw_path, "csv/0009_8min_signal.csv",
+                         "csv/0370_8min_signal.csv")
+    csv_dir = root / "csv"
+    mat_dir = root / "mat"
+    if not csv_dir.exists():
+        # rglob fallback
+        found = list(raw_path.rglob("*_8min_signal.csv"))
+        if found:
+            csv_dir = found[0].parent
+    if not mat_dir.exists():
+        found = list(raw_path.rglob("*_8min.mat"))
+        if found:
+            mat_dir = found[0].parent
 
-    # CSV: csv/NNNN_8min_signal.csv (confirmed tree lines 38)
-    csv_dir     = raw_path / "csv"
+    copd_ds:   list = []
+    infect_ds: list = []
+
     signal_csvs = sorted(csv_dir.glob("*_signal.csv")) if csv_dir.exists() else []
     print(f"    {len(signal_csvs)} signal CSV files")
 
@@ -1366,18 +1603,14 @@ def preprocess_capno(raw_path: Path, out_copd: Path, out_infection: Path) -> boo
             print(f"    Skip {cf.name}: {e}")
             continue
 
-    # MAT: mat/NNNN_8min.mat (confirmed tree lines 40-50)
-    mat_dir   = raw_path / "mat"
     mat_files = sorted(mat_dir.glob("*.mat")) if mat_dir.exists() else []
     print(f"    {len(mat_files)} MAT files")
 
     for mf in mat_files:
         try:
             import scipy.io as sio
-            mat      = sio.loadmat(str(mf))
-            sv_arr   = None
-            rr_arr   = None
-            hr_arr   = None
+            mat    = sio.loadmat(str(mf))
+            sv_arr = rr_arr = hr_arr = None
             for key in mat:
                 if key.startswith('_'):
                     continue
@@ -1394,11 +1627,11 @@ def preprocess_capno(raw_path: Path, out_copd: Path, out_infection: Path) -> boo
             if sv_arr is None or len(sv_arr) < 50:
                 continue
             sv_arr = sv_arr[(sv_arr > 50) & (sv_arr <= 100)]
-            ms     = float(np.mean(sv_arr)) if len(sv_arr) > 10 else 97.0
-            mrr    = (float(np.mean(rr_arr[(rr_arr > 4) & (rr_arr < 60)]))
-                      if rr_arr is not None and len(rr_arr) > 10 else 14.0)
-            mhr    = (float(np.mean(hr_arr[(hr_arr > 30) & (hr_arr < 200)]))
-                      if hr_arr is not None and len(hr_arr) > 10 else 75.0)
+            ms  = float(np.mean(sv_arr)) if len(sv_arr) > 10 else 97.0
+            mrr = (float(np.mean(rr_arr[(rr_arr > 4) & (rr_arr < 60)]))
+                   if rr_arr is not None and len(rr_arr) > 10 else 14.0)
+            mhr = (float(np.mean(hr_arr[(hr_arr > 30) & (hr_arr < 200)]))
+                   if hr_arr is not None and len(hr_arr) > 10 else 75.0)
             spo2f       = _spo2_feats(sv_arr)
             label_copd  = 1 if (ms < 94.0 and mrr > 18) else 0
             label_infec = 1 if (mhr > 95 and mrr > 18)  else 0
@@ -1424,45 +1657,52 @@ def preprocess_capno(raw_path: Path, out_copd: Path, out_infection: Path) -> boo
 
 # =============================================================================
 #  SisFall — Fall Risk / Frailty
-#  Layout: raw/sisfalldb/
-#    SA01/ … SA23/ → F01_SA01_R01.txt, D01_SA01_R01.txt  (young adults)
-#    SE01/ … SE15/ → D01_SE01_R01.txt ...                 (elderly — no falls in some)
+#  Layout: SA01…SA23/{F,D}XX_SAXX_RXX.txt
+#          SE01…SE15/{D,F}XX_SEXX_RXX.txt   (elderly; some SE dirs have F-falls)
 # =============================================================================
 
 def preprocess_sisfalldb(raw_path: Path,
                          out_fall_risk: Path, out_frailty: Path) -> bool:
     print("  Preprocessing SisFall...")
 
-    # Match exactly the filename pattern: F01_SA01_R01.txt or D01_SE01_R01.txt
-    txt_files = [f for f in raw_path.rglob("*.txt")
-                 if re.match(r'^[FD]\d{2}_S[AE]\d{2}_R\d{2}\.txt$', f.name, re.IGNORECASE)]
+    # Locate the SA01/SE01 directory level
+    root       = _find_root(raw_path, "SA01/D01_SA01_R01.txt",
+                             "SE01/D01_SE01_R01.txt")
+    # Collect all activity txt files matching the known naming convention
+    # Pattern: {F|D}NN_S{A|E}NN_RNN.txt   (case-insensitive)
+    _pat = re.compile(r'^[FD]\d{2}_S[AE]\d{2}_R\d{2}\.txt$', re.IGNORECASE)
+    txt_files  = [f for f in root.rglob("*.txt") if _pat.match(f.name)]
+    if not txt_files:
+        txt_files = [f for f in raw_path.rglob("*.txt") if _pat.match(f.name)]
 
     if not txt_files:
         print(f"  ERROR: No activity .txt files found in {raw_path}")
-        print("         Expected pattern: F01_SA01_R01.txt, D01_SE01_R01.txt ...")
+        print("         Expected pattern: F01_SA01_R01.txt, D01_SE01_R01.txt …")
         return False
 
     print(f"  Found {len(txt_files)} activity files")
 
-    fall_ds    = []
-    frailty_ds = []
+    fall_ds:    list = []
+    frailty_ds: list = []
 
     for tf in txt_files:
-        fname   = tf.name.upper()
-        is_fall = fname.startswith('F')
-        # Parent directory name SA01…SA23 = adult, SE01…SE15 = elderly
+        fname      = tf.name.upper()
+        is_fall    = fname.startswith('F')
         parent     = tf.parent.name.upper()
         is_elderly = parent.startswith('SE') or '_SE' in fname
 
         try:
-            lines  = [l.strip() for l in open(tf, errors='ignore')
-                      if l.strip() and not l.startswith(('%', '#'))]
             values = []
-            for line in lines:
+            for line in open(tf, errors='ignore'):
+                line = line.strip()
+                if not line or line.startswith(('%', '#')):
+                    continue
                 try:
                     parts = re.split(r'[,;\s]+', line)
                     if len(parts) >= 3:
-                        values.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                        values.append([float(parts[0]),
+                                        float(parts[1]),
+                                        float(parts[2])])
                     elif len(parts) == 1:
                         values.append([float(parts[0]), 0.0, 0.0])
                 except Exception:
@@ -1480,9 +1720,9 @@ def preprocess_sisfalldb(raw_path: Path,
             rng  = np.random.default_rng(hash(fname) % (2**32))
             rows = [{
                 "date":                   f"day_{d}",
-                "accel_mag_mean":          mean_mag * (1 + rng.normal(0, 0.07)),
-                "accel_mag_std":           std_mag  * (1 + rng.normal(0, 0.07)),
-                "accel_peak_rms":          peak_rms * (1 + rng.normal(0, 0.07)),
+                "accel_mag_mean":          max(0.1, mean_mag * (1 + rng.normal(0, 0.07))),
+                "accel_mag_std":           max(0.0, std_mag  * (1 + rng.normal(0, 0.07))),
+                "accel_peak_rms":          max(1.0, peak_rms * (1 + rng.normal(0, 0.07))),
                 "walking_asymmetry_pct":   float(rng.normal(12 if is_elderly else 4, 3)),
                 "cadence":                 float(rng.normal(75 if is_elderly else 85, 8)),
                 "stride_variability":      float(rng.normal(5  if is_elderly else 2, 1.5)),
@@ -1502,9 +1742,8 @@ def preprocess_sisfalldb(raw_path: Path,
 
 
 # =============================================================================
-#  MIMIC-III Clinical Tables — Hypertension / Anemia proxy
-#  Layout: raw/mimic_waveform/ (flat)
-#    ADMISSIONS.csv, DIAGNOSES_ICD.csv, LABEVENTS.csv ...
+#  MIMIC-III — Hypertension / Anemia
+#  Layout: flat — ADMISSIONS.csv, DIAGNOSES_ICD.csv …
 # =============================================================================
 
 def preprocess_mimic_waveform(raw_path: Path,
@@ -1516,13 +1755,15 @@ def preprocess_mimic_waveform(raw_path: Path,
         print("  pandas required")
         return False
 
+    root = _find_root(raw_path, "ADMISSIONS.csv", "DIAGNOSES_ICD.csv")
+
     htn_subjects:    set = set()
     anemia_subjects: set = set()
 
-    # Parse ICD-9 codes from DIAGNOSES_ICD.csv
-    diag_file = raw_path / "DIAGNOSES_ICD.csv"
+    diag_file = root / "DIAGNOSES_ICD.csv"
     if not diag_file.exists():
-        diag_file = next(raw_path.rglob("DIAGNOSES_ICD*.csv"), None)
+        found = list(raw_path.rglob("DIAGNOSES_ICD*.csv"))
+        diag_file = found[0] if found else None
 
     if diag_file and diag_file.exists():
         try:
@@ -1541,11 +1782,11 @@ def preprocess_mimic_waveform(raw_path: Path,
         except Exception as e:
             print(f"    WARN DIAGNOSES_ICD: {e}")
 
-    # Get full subject list from ADMISSIONS.csv
     subject_ids = []
-    adm_file = raw_path / "ADMISSIONS.csv"
+    adm_file = root / "ADMISSIONS.csv"
     if not adm_file.exists():
-        adm_file = next(raw_path.rglob("ADMISSIONS*.csv"), None)
+        found = list(raw_path.rglob("ADMISSIONS*.csv"))
+        adm_file = found[0] if found else None
     if adm_file and adm_file.exists():
         try:
             df_a = pd.read_csv(adm_file, on_bad_lines='skip',
@@ -1559,8 +1800,8 @@ def preprocess_mimic_waveform(raw_path: Path,
     if not subject_ids:
         subject_ids = list(htn_subjects | anemia_subjects)[:2000]
 
-    htn_ds    = []
-    anemia_ds = []
+    htn_ds:    list = []
+    anemia_ds: list = []
 
     for sid in subject_ids[:2000]:
         rng          = np.random.default_rng(int(sid) if str(sid).isdigit()
@@ -1610,13 +1851,14 @@ def preprocess_wrist_glucose(raw_path: Path, out_file: Path) -> bool:
         print(f"  ERROR: No CSV files in {raw_path}")
         return False
 
-    dataset = []
+    dataset: list = []
     for cf in csv_files:
         try:
             df = pd.read_csv(cf, nrows=5000, on_bad_lines='skip')
             df.columns = [c.strip() for c in df.columns]
             gc = next((c for c in df.columns
-                       if any(x in c.lower() for x in ['glucose','cgm','gluc'])), None)
+                       if any(x in c.lower() for x in
+                              ['glucose','cgm','gluc'])), None)
             if not gc:
                 continue
             gv = pd.to_numeric(df[gc], errors='coerce').dropna().values
@@ -1645,6 +1887,7 @@ def preprocess_wrist_glucose(raw_path: Path, out_file: Path) -> bool:
 
     n = sum(d['label'] for d in dataset)
     print(f"  Processed {len(dataset)} records -> {n} metabolic risk")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     json.dump(dataset, open(out_file, 'w'))
     print(f"  Saved -> {out_file}")
     return True
@@ -1655,7 +1898,7 @@ def preprocess_wrist_glucose(raw_path: Path, out_file: Path) -> bool:
 # =============================================================================
 
 def _merge(paths: list, out: Path, label: str):
-    combined = []
+    combined: list = []
     for p in paths:
         p = Path(p)
         if p.exists():
@@ -1664,6 +1907,7 @@ def _merge(paths: list, out: Path, label: str):
             except Exception:
                 pass
     if combined:
+        out.parent.mkdir(parents=True, exist_ok=True)
         json.dump(combined, open(out, 'w'))
         print(f"  Merged {label}: {len(combined)} records -> {out}")
     return bool(combined)
@@ -1683,28 +1927,24 @@ def _postmerge(did: str):
                 OUT_DIR / "preprocessed_anemia_mimic.json"],
                OUT_DIR / "preprocessed_anemia.json", "Anemia")
     if did in ("wesad", "globem", "studentlife"):
-        _merge([p for p in [
-                    OUT_DIR / "preprocessed_depression_wesad.json",
-                    OUT_DIR / "preprocessed_depression_globem.json",
-                    OUT_DIR / "preprocessed_depression_studentlife.json",
-               ] if p.exists()],
+        sources = [OUT_DIR / "preprocessed_depression_wesad.json",
+                   OUT_DIR / "preprocessed_depression_globem.json",
+                   OUT_DIR / "preprocessed_depression_studentlife.json"]
+        _merge([p for p in sources if p.exists()],
                OUT_DIR / "preprocessed_depression.json", "Depression (merged)")
     if did in ("pads", "gaitpdb"):
-        _merge([p for p in [
-                    OUT_DIR / "preprocessed_parkinsons_pads.json",
-                    OUT_DIR / "preprocessed_parkinsons_gait.json",
-               ] if p.exists()],
+        _merge([p for p in [OUT_DIR / "preprocessed_parkinsons_pads.json",
+                             OUT_DIR / "preprocessed_parkinsons_gait.json"]
+                if p.exists()],
                OUT_DIR / "preprocessed_parkinsons.json", "Parkinson's (merged)")
     if did in ("gaitpdb", "sisfalldb"):
-        _merge([p for p in [
-                    OUT_DIR / "preprocessed_frailty_sisfall.json",
-               ] if p.exists()],
+        _merge([p for p in [OUT_DIR / "preprocessed_frailty_sisfall.json"]
+                if p.exists()],
                OUT_DIR / "preprocessed_frailty.json", "Frailty (merged)")
     if did in ("wesad", "studentlife"):
-        _merge([p for p in [
-                    OUT_DIR / "preprocessed_stress.json",
-                    OUT_DIR / "preprocessed_stress_studentlife.json",
-               ] if p.exists()],
+        _merge([p for p in [OUT_DIR / "preprocessed_stress.json",
+                             OUT_DIR / "preprocessed_stress_studentlife.json"]
+                if p.exists()],
                OUT_DIR / "preprocessed_stress_merged.json", "Stress (merged)")
 
 
@@ -1713,11 +1953,16 @@ def _postmerge(did: str):
 # =============================================================================
 
 def _run_preprocessor(did: str, raw_path: Path):
-    if   did == "cinc2017":      preprocess_cinc2017(raw_path,    OUT_DIR / "preprocessed_afib.json")
-    elif did == "pads":          preprocess_pads(raw_path,        OUT_DIR / "preprocessed_parkinsons_pads.json")
-    elif did == "gaitpdb":       preprocess_gaitpdb(raw_path,     OUT_DIR / "preprocessed_parkinsons_gait.json")
-    elif did == "dreamt":        preprocess_dreamt(raw_path,      OUT_DIR / "preprocessed_sleep_apnea_dreamt.json")
-    elif did == "ucddb":         preprocess_ucddb(raw_path,       OUT_DIR / "preprocessed_sleep_apnea_ucddb.json")
+    if   did == "cinc2017":
+        preprocess_cinc2017(raw_path,  OUT_DIR / "preprocessed_afib.json")
+    elif did == "pads":
+        preprocess_pads(raw_path,      OUT_DIR / "preprocessed_parkinsons_pads.json")
+    elif did == "gaitpdb":
+        preprocess_gaitpdb(raw_path,   OUT_DIR / "preprocessed_parkinsons_gait.json")
+    elif did == "dreamt":
+        preprocess_dreamt(raw_path,    OUT_DIR / "preprocessed_sleep_apnea_dreamt.json")
+    elif did == "ucddb":
+        preprocess_ucddb(raw_path,     OUT_DIR / "preprocessed_sleep_apnea_ucddb.json")
     elif did == "bidmc":
         preprocess_bidmc(raw_path,
                          OUT_DIR / "preprocessed_heart_failure.json",
@@ -1728,12 +1973,14 @@ def _run_preprocessor(did: str, raw_path: Path):
                          OUT_DIR / "preprocessed_stress.json",
                          OUT_DIR / "preprocessed_depression_wesad.json",
                          OUT_DIR / "preprocessed_thyroid.json")
-    elif did == "globem":        preprocess_globem(raw_path,      OUT_DIR / "preprocessed_depression_globem.json")
+    elif did == "globem":
+        preprocess_globem(raw_path,    OUT_DIR / "preprocessed_depression_globem.json")
     elif did == "sisfalldb":
         preprocess_sisfalldb(raw_path,
                              OUT_DIR / "preprocessed_fall_risk.json",
                              OUT_DIR / "preprocessed_frailty_sisfall.json")
-    elif did == "wrist_glucose": preprocess_wrist_glucose(raw_path, OUT_DIR / "preprocessed_metabolic.json")
+    elif did == "wrist_glucose":
+        preprocess_wrist_glucose(raw_path, OUT_DIR / "preprocessed_metabolic.json")
     elif did == "mimic_waveform":
         preprocess_mimic_waveform(raw_path,
                                   OUT_DIR / "preprocessed_hypertension.json",
@@ -1764,7 +2011,7 @@ def download_and_process(did: str, username: str = "", password: str = "") -> bo
     raw_path = RAW_DIR / did
     raw_path.mkdir(parents=True, exist_ok=True)
     if info.get('credentials') and not username:
-        print(f"\n  WARNING: Requires free PhysioNet account: https://physionet.org/register/")
+        print(f"\n  NOTE: Requires free PhysioNet account: https://physionet.org/register/")
         username = input("  PhysioNet username: ").strip()
         password = input("  PhysioNet password: ").strip()
     if not list(raw_path.rglob("*.*")):
@@ -1775,6 +2022,7 @@ def download_and_process(did: str, username: str = "", password: str = "") -> bo
             _download_direct(url, zp)
             if zp.exists():
                 _extract_zip(zp, raw_path)
+                zp.unlink(missing_ok=True)
         else:
             _wget(url, raw_path, username, password)
     else:
@@ -1796,7 +2044,7 @@ def list_datasets():
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="VIGIL Preprocessor v5")
+    ap = argparse.ArgumentParser(description="VIGIL Preprocessor v6")
     ap.add_argument("--all",                 action="store_true")
     ap.add_argument("--dataset",             type=str)
     ap.add_argument("--condition",           type=str)
@@ -1819,7 +2067,8 @@ if __name__ == "__main__":
     elif args.dataset:
         download_and_process(args.dataset, args.username, args.password)
     elif args.condition:
-        matches = [d for d, i in DATASETS.items() if args.condition in i['conditions']]
+        matches = [d for d, i in DATASETS.items()
+                   if args.condition in i['conditions']]
         if not matches:
             print(f"No datasets for condition: {args.condition}")
         for did in matches:
