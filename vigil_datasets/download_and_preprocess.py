@@ -29,10 +29,10 @@ from pathlib import Path
 from typing import Optional, List
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-HERE     = Path(__file__).parent
-DATA_DIR = HERE / "data"
-RAW_DIR  = DATA_DIR / "raw"
-OUT_DIR  = DATA_DIR
+
+RAW_DIR = Path("/Users/rushilmohan/Documents/Coding/Python/Projects/passive-health-moniter/vigil_datasets/data/raw")
+DATA_DIR = RAW_DIR.parent
+OUT_DIR = DATA_DIR
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
