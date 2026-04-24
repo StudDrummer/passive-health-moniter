@@ -71,7 +71,7 @@ from pathlib import Path
 from typing import List, Optional
 
 # ── Paths (relative to this script's location = vigil_datasets/) ─────────────
-# Always anchor to vigil_datasets root regardless of where this file lives
+# Always anchor to the vigil_datasets project root
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR     = PROJECT_ROOT / "data"
 RAW_DIR      = DATA_DIR / "raw"
@@ -1898,7 +1898,7 @@ if __name__ == "__main__":
     elif args.preprocess_existing:
         for did in DATASETS:
             raw = RAW_DIR / did
-            if raw.exists() and list(raw.rglob("*.*")):
+            if raw.exists() and any(p.is_file() for p in raw.rglob("*")):
                 print(f"\n  Processing existing raw data for [{did}]…")
                 _run_preprocessor(did, raw)
             else:
