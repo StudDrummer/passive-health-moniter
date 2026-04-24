@@ -1045,7 +1045,8 @@ def preprocess_studentlife(raw: Path, out_dep: Path, out_stress: Path) -> bool:
         for f in sorted(act_dir.glob("activity_u*.csv")):
             # activity_u00.csv -> uid = u00
             uid = "u" + re.sub(r'^activity_u0*', '', f.stem) or "u0"
-            uid = f"u{int(re.search(r'u(\d+)', f.stem).group(1)):02d}"
+            match = re.search(r'u(\d+)', f.stem)
+            uid = f"u{int(match.group(1)):02d}"
             try:
                 act_data[uid] = pd.read_csv(f, on_bad_lines='skip').to_dict('records')
             except Exception:
