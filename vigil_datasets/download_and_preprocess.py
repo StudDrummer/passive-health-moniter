@@ -71,10 +71,10 @@ from pathlib import Path
 from typing import List, Optional
 
 # ── Paths (relative to this script's location = vigil_datasets/) ─────────────
-HERE     = Path(__file__).parent
-DATA_DIR = HERE / "data"
-RAW_DIR  = DATA_DIR / "raw"
-OUT_DIR  = DATA_DIR
+# Always anchor to vigil_datasets root regardless of where this file lives
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR     = PROJECT_ROOT / "data"
+RAW_DIR      = DATA_DIR / "raw"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -341,7 +341,7 @@ def preprocess_cinc2017(raw: Path, out: Path) -> bool:
 
     # Look for REFERENCE.csv — confirmed at training/REFERENCE.csv
     # but also handle case where it landed at training/training/REFERENCE.csv
-    # after a zip extraction with a nested folder.
+    # after a zip extraction with a nested folder.          
     ref = None
     for candidate in sorted(raw.rglob("REFERENCE.csv"), key=lambda p: len(p.parts)):
         # Prefer the one inside "training" not "validation"
