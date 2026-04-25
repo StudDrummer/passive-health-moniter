@@ -154,7 +154,7 @@ DATASETS = {
         "conditions": ["stress", "depression"],
         "credentials": False,
         "size_mb": 740,
-        "url": "https://archive.ics.uci.edu/static/public/465/wesad+wearable+stress+and+affect+detection.zip",
+        "url": "https://archive.ics.uci.edu/ml/machine-learning-databases/00465/WESAD.zip",
         "citation": "Schmidt et al.",
     },
     "globem": {
