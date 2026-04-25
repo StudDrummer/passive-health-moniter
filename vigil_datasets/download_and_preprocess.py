@@ -78,7 +78,34 @@ RAW_DIR      = DATA_DIR / "raw"
 OUT_DIR = DATA_DIR
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 RAW_DIR.mkdir(parents=True, exist_ok=True)
+import zipfile
+import requests
+from pathlib import Path
+import shutil
 
+def _is_real_zip(path: Path) -> bool:
+    return path.exists() and zipfile.is_zipfile(path)
+
+def _safe_download(url: str, dest: Path):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"  Downloading → {url}")
+
+    r = requests.get(url, stream=True, timeout=60)
+
+    # FAIL FAST if HTML page
+    content_type = r.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        raise ValueError(f"❌ Refusing HTML download (bad URL): {url}")
+
+    with open(dest, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+    # validate zip if expected
+    if dest.suffix == ".zip" and not zipfile.is_zipfile(dest):
+        raise ValueError(f"❌ Downloaded file is NOT a zip: {dest}")
 # ── Dataset registry ──────────────────────────────────────────────────────────
 DATASETS = {
     "cinc2017": {
@@ -1833,61 +1860,65 @@ def download_and_process(did: str, username: str = "", password: str = "") -> bo
     print(f"\n{'='*62}\n  {info['name']}\n  Conditions: {', '.join(info['conditions'])}\n{'='*62}")
 
     raw = RAW_DIR / did
+    raw.mkdir(parents=True, exist_ok=True)
 
-    # Prompt for PhysioNet credentials if required
-    if info.get('credentials') and not username:
-        print("  NOTE: Requires free PhysioNet account — https://physionet.org/register/")
-        username = input("  Username: ").strip()
-        password = input("  Password: ").strip()
-
-    # ---- REAL DATA CHECK (critical fix) ----
-    def _real_files(p: Path):
+    def has_real_data(p: Path):
         if not p.exists():
-            return []
-        return [
-            f for f in p.rglob("*")
-            if f.is_file() and f.stat().st_size > 100_000  # ignore html/txt/junk
-        ]
+            return False
+        return any(f.is_file() and f.stat().st_size > 50_000 for f in p.rglob("*"))
 
-    has_real_data = len(_real_files(raw)) > 10
+    # -----------------------------
+    # DOWNLOAD ONLY IF NEEDED
+    # -----------------------------
+    if not has_real_data(raw):
+        print(f"  No valid dataset → downloading {did}")
 
-    # ---- DOWNLOAD IF NEEDED ----
-    if not has_real_data:
-        print(f"  No valid dataset found in {raw}, downloading...")
-
-        # clean any broken leftovers
-        if raw.exists():
-            shutil.rmtree(raw)
+        # CLEAN CORRUPT DATA FIRST
+        shutil.rmtree(raw, ignore_errors=True)
         raw.mkdir(parents=True, exist_ok=True)
 
-        url = info['url']
+        url = info["url"]
 
-        # ZIP / Zenodo / UCI style downloads
-        if any(x in url.lower() for x in ('zip', 'zenodo', 'archive.ics')):
-            zp = RAW_DIR / f"{did}.zip"
-            _download_direct(url, zp)
+        try:
+            # ZIP-based datasets
+            if url.endswith(".zip"):
+                zip_path = RAW_DIR / f"{did}.zip"
+                _safe_download(url, zip_path)
 
-            if zp.exists():
-                _extract_zip(zp, raw)
+                with zipfile.ZipFile(zip_path, 'r') as z:
+                    z.extractall(raw)
 
-                # ---- WESAD fix: remove extra folder layer ----
-                inner = raw / "WESAD"
-                if inner.exists() and inner.is_dir():
-                    for item in inner.iterdir():
-                        item.rename(raw / item.name)
-                    inner.rmdir()
+                zip_path.unlink(missing_ok=True)
 
-                zp.unlink(missing_ok=True)
+            # PhysioNet / wget style
+            else:
+                _wget(url, raw, username, password)
 
-        # PhysioNet / wget style downloads
-        else:
-            _wget(url, raw, username, password)
+        except Exception as e:
+            print(f"\n❌ DOWNLOAD FAILED for {did}")
+            print(f"Reason: {e}")
+            return False
 
     else:
-        print(f"  Raw data present in {raw}, skipping download.")
+        print(f"  Raw data OK → skipping download")
 
-    # ---- PREPROCESS ----
+    # -----------------------------
+    # POST-CHECK (CRITICAL FIX)
+    # -----------------------------
+    if did == "wesad":
+        expected = raw.glob("S*/S*.pkl")
+        if not any(expected):
+            raise ValueError("❌ WESAD is invalid (missing SXX folders)")
+
+    if did == "globem":
+        if not any(raw.glob("INS-*")):
+            raise ValueError("❌ GLOBEM invalid structure")
+
+    # -----------------------------
+    # PREPROCESS
+    # -----------------------------
     _run_preprocessor(did, raw)
+
     return True
 
 def list_datasets():
