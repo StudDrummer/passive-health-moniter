@@ -42,6 +42,111 @@ except ImportError:
     import vigil_features as vf
 
 
+# ─── Hardcoded metadata for all 14 conditions ─────────────────────────────────
+# Used as fallback when no _meta.json file exists on disk.
+
+_CONDITION_META = {
+    'afib': {
+        'condition_label':  'Atrial Fibrillation Risk',
+        'category':         'cardiovascular',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.97,
+    },
+    'parkinsons': {
+        'condition_label':  "Parkinson's / Movement Risk",
+        'category':         'neurological',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.96,
+    },
+    'sleep_apnea': {
+        'condition_label':  'Sleep Apnea Risk',
+        'category':         'respiratory',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.94,
+    },
+    'heart_failure': {
+        'condition_label':  'Cardiac Decompensation Risk',
+        'category':         'cardiovascular',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.90,
+    },
+    'infection': {
+        'condition_label':  'Acute Infection Signal',
+        'category':         'immune',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.82,
+    },
+    'frailty': {
+        'condition_label':  'Frailty / Low Fitness',
+        'category':         'functional',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.88,
+    },
+    'stress': {
+        'condition_label':  'Chronic Stress / Autonomic Overload',
+        'category':         'mental_health',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.93,
+    },
+    'depression': {
+        'condition_label':  'Depression / MDD Pattern',
+        'category':         'mental_health',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.78,
+    },
+    'metabolic': {
+        'condition_label':  'Metabolic / Insulin Resistance Risk',
+        'category':         'metabolic',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.81,
+    },
+    'fall_risk': {
+        'condition_label':  'Fall Risk',
+        'category':         'functional',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.96,
+    },
+    'hypertension': {
+        'condition_label':  'Hypertension Risk',
+        'category':         'cardiovascular',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.88,
+    },
+    'copd': {
+        'condition_label':  'COPD / Respiratory Disease',
+        'category':         'respiratory',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.87,
+    },
+    'thyroid': {
+        'condition_label':  'Thyroid Dysfunction',
+        'category':         'endocrine',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.82,
+    },
+    'anemia': {
+        'condition_label':  'Anemia / Low Perfusion',
+        'category':         'hematologic',
+        'alert_threshold':  0.40,
+        'urgent_threshold': 0.65,
+        'published_auc':    0.84,
+    },
+}
+
+
 # ─── Model registry ───────────────────────────────────────────────────────────
 
 _MODELS_CACHE: dict = {}   # condition_id → (model, meta)
@@ -51,29 +156,32 @@ def _models_dir():
     env = os.environ.get('VIGIL_MODELS_DIR')
     if env and os.path.isdir(env):
         return env
-    # Relative to this file
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, 'models')
 
 
 def _load_model(condition_id: str):
-    """Load and cache a model + meta from disk."""
+    """Load and cache a model + meta from disk. Falls back to hardcoded meta."""
     if condition_id in _MODELS_CACHE:
         return _MODELS_CACHE[condition_id]
     mdir = _models_dir()
     model_path = os.path.join(mdir, f"{condition_id}_model.joblib")
     meta_path  = os.path.join(mdir, f"{condition_id}_meta.json")
     if not os.path.exists(model_path):
-        return None, None
+        return None, _CONDITION_META.get(condition_id, {})
     model = joblib.load(model_path)
-    meta  = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
+    # Use disk meta if present, otherwise fall back to hardcoded
+    if os.path.exists(meta_path):
+        meta = json.load(open(meta_path))
+    else:
+        meta = _CONDITION_META.get(condition_id, {})
     _MODELS_CACHE[condition_id] = (model, meta)
     return model, meta
 
 
 def _level(prob: float, alert_t: float, urgent_t: float) -> str:
-    if prob >= urgent_t: return 'high'
-    if prob >= alert_t:  return 'elevated'
+    if prob >= urgent_t:      return 'high'
+    if prob >= alert_t:       return 'elevated'
     if prob >= alert_t * 0.6: return 'moderate'
     return 'low'
 
@@ -96,12 +204,12 @@ def score_condition(condition_id: str, rows: list) -> dict:
 
     base = {
         "condition_id":    condition_id,
-        "condition_label": meta.get('condition_label', condition_id) if meta else condition_id,
-        "category":        meta.get('category', 'unknown') if meta else 'unknown',
+        "condition_label": meta.get('condition_label', condition_id),
+        "category":        meta.get('category', 'unknown'),
         "scored_at":       scored_at,
-        "published_auc":   meta.get('published_auc', 0.0) if meta else 0.0,
-        "alert_threshold": meta.get('alert_threshold', 0.40) if meta else 0.40,
-        "urgent_threshold":meta.get('urgent_threshold', 0.65) if meta else 0.65,
+        "published_auc":   meta.get('published_auc', 0.0),
+        "alert_threshold": meta.get('alert_threshold', 0.40),
+        "urgent_threshold":meta.get('urgent_threshold', 0.65),
     }
 
     # ── Feature extraction ───────────────────────────────────────────────
@@ -126,7 +234,7 @@ def score_condition(condition_id: str, rows: list) -> dict:
 
     # ── Inference ────────────────────────────────────────────────────────
     try:
-        prob = float(model.predict_proba(feat.reshape(1,-1))[0, 1])
+        prob = float(model.predict_proba(feat.reshape(1, -1))[0, 1])
     except Exception as e:
         return {**base,
                 "probability": 0.0, "score_0_100": 0.0, "level": "low",
@@ -163,7 +271,6 @@ def score_condition(condition_id: str, rows: list) -> dict:
 
 # ─── Full patient scorer ──────────────────────────────────────────────────────
 
-# All 14 conditions trained in v2
 CONDITIONS = [
     'afib', 'parkinsons', 'sleep_apnea', 'heart_failure',
     'infection', 'frailty', 'stress', 'depression',
@@ -289,12 +396,11 @@ if __name__ == '__main__':
         save_scores_to_db(args.db, result)
         print(f"Saved {len(result['scores'])} scores to {args.db}")
     if args.json:
-        import json
         print(json.dumps(result, indent=2))
     else:
         print(f"\nHealth Index: {result['health_index']}/100")
         print(f"Scored at: {result['scored_at']}\n")
         for s in result['scores']:
-            flag = '🚨' if s.get('urgent') else ('⚠️ ' if s['level'] in ['elevated'] else '  ')
+            flag = '🚨' if s.get('urgent') else ('⚠️ ' if s['level'] == 'elevated' else '  ')
             status = '—' if s['insufficient_data'] else f"{s['score_0_100']:5.1f}"
-            print(f"  {flag} {s['condition_label']:<38} {status}  [{s['level']:<9}] {s['data_quality']}")
+            print(f"  {flag} {s['condition_label']:<40} {status}  [{s['level']:<9}] {s['data_quality']}")
