@@ -1845,29 +1845,68 @@ def _run_preprocessor(did: str, raw: Path):
 def download_and_process(did: str, username: str = "", password: str = "") -> bool:
     info = DATASETS.get(did)
     if not info:
-        print(f"Unknown dataset: {did}"); return False
+        print(f"Unknown dataset: {did}")
+        return False
+
     print(f"\n{'='*62}\n  {info['name']}\n  Conditions: {', '.join(info['conditions'])}\n{'='*62}")
+
     raw = RAW_DIR / did
-    raw.mkdir(parents=True, exist_ok=True)
+
+    # Prompt for PhysioNet credentials if required
     if info.get('credentials') and not username:
-        print(f"  NOTE: Requires free PhysioNet account — https://physionet.org/register/")
+        print("  NOTE: Requires free PhysioNet account — https://physionet.org/register/")
         username = input("  Username: ").strip()
         password = input("  Password: ").strip()
-    if not list(raw.rglob("*.*")):
+
+    # ---- REAL DATA CHECK (critical fix) ----
+    def _real_files(p: Path):
+        if not p.exists():
+            return []
+        return [
+            f for f in p.rglob("*")
+            if f.is_file() and f.stat().st_size > 100_000  # ignore html/txt/junk
+        ]
+
+    has_real_data = len(_real_files(raw)) > 10
+
+    # ---- DOWNLOAD IF NEEDED ----
+    if not has_real_data:
+        print(f"  No valid dataset found in {raw}, downloading...")
+
+        # clean any broken leftovers
+        if raw.exists():
+            shutil.rmtree(raw)
+        raw.mkdir(parents=True, exist_ok=True)
+
         url = info['url']
+
+        # ZIP / Zenodo / UCI style downloads
         if any(x in url.lower() for x in ('zip', 'zenodo', 'archive.ics')):
             zp = RAW_DIR / f"{did}.zip"
             _download_direct(url, zp)
+
             if zp.exists():
                 _extract_zip(zp, raw)
+
+                # ---- WESAD fix: remove extra folder layer ----
+                inner = raw / "WESAD"
+                if inner.exists() and inner.is_dir():
+                    for item in inner.iterdir():
+                        item.rename(raw / item.name)
+                    inner.rmdir()
+
                 zp.unlink(missing_ok=True)
+
+        # PhysioNet / wget style downloads
         else:
             _wget(url, raw, username, password)
+
     else:
         print(f"  Raw data present in {raw}, skipping download.")
+
+    # ---- PREPROCESS ----
     _run_preprocessor(did, raw)
     return True
-
 
 def list_datasets():
     print("\nVIGIL Dataset Registry — v7")
@@ -1899,7 +1938,7 @@ if __name__ == "__main__":
     elif args.preprocess_existing:
         for did in DATASETS:
             raw = RAW_DIR / did
-            if raw.exists() and any(p.is_file() for p in raw.rglob("*")):
+            if raw.exists() and any(p.is_dir() for p in raw.iterdir()):
                 print(f"\n  Processing existing raw data for [{did}]…")
                 _run_preprocessor(did, raw)
             else:
