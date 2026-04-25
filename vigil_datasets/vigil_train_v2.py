@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 VIGIL Training Pipeline v2 — 14-Condition Extended Edition
 ===========================================================
@@ -729,11 +728,11 @@ def train_condition(condition: str, data_dir: Path, models_dir: Path):
     # ── Cross-validation ──────────────────────────────────────────────────────
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     cv_auc = cross_val_score(calibrated, X, y,
-                              scoring='roc_auc', cv=cv,
-                              fit_params={'sample_weight': sample_weights})
+                              scoring="roc_auc", cv=cv)
+                              
     cv_ap  = cross_val_score(calibrated, X, y,
-                              scoring='average_precision', cv=cv,
-                              fit_params={'sample_weight': sample_weights})
+                              scoring='average_precision', cv=cv)
+                              
 
     print(f"  CV ROC-AUC:   {np.mean(cv_auc):.3f} ± {np.std(cv_auc):.3f}")
     print(f"  CV Avg Prec:  {np.mean(cv_ap):.3f}  ± {np.std(cv_ap):.3f}")
@@ -841,4 +840,4 @@ if __name__ == "__main__":
         results.append(r)
 
     write_report(results, report_dir / "training_report_v2.txt")
-    print("\nDone.")
+    print("\nDone.") 
