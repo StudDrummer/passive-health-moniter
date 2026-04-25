@@ -8,7 +8,7 @@ Called by:
   3. Real-time path (called on every sync completion)
 
 Architecture:
-  SQLite daily_summary rows → vigil_features.py → model.predict_proba → score
+  SQLite daily_summary rows → vigil_features_v2.py → model.predict_proba → score
 
 Output per condition:
   {
@@ -29,16 +29,17 @@ Output per condition:
   }
 """
 
-
-
 import os, json, math, sqlite3
 from datetime import datetime
 from typing import Optional
 import numpy as np
 import joblib
 
-import vigil_ml.vigil_features as vf
-
+# ── Feature extraction: prefer v2 (14 conditions), fall back to v1 ────────────
+try:
+    import vigil_ml.vigil_features_v2 as vf
+except ImportError:
+    import vigil_ml.vigil_features as vf
 
 
 # ─── Model registry ───────────────────────────────────────────────────────────
@@ -141,7 +142,6 @@ def score_condition(condition_id: str, rows: list) -> dict:
     # ── Top contributing signals (SHAP-lite: feature × magnitude) ────────
     top_signals = []
     if meta and meta.get('feature_names') and len(feat) == len(meta['feature_names']):
-        # Simple approximate attribution: feature value deviation from neutral (0.5)
         deviations = [(name, float(abs(feat[i])))
                       for i, name in enumerate(meta['feature_names'])
                       if name != 'completeness_flag']
@@ -150,30 +150,37 @@ def score_condition(condition_id: str, rows: list) -> dict:
 
     return {
         **base,
-        "probability":     round(prob, 4),
-        "score_0_100":     round(prob * 100, 1),
-        "level":           level,
-        "urgent":          prob >= urgent_t,
+        "probability":       round(prob, 4),
+        "score_0_100":       round(prob * 100, 1),
+        "level":             level,
+        "urgent":            prob >= urgent_t,
         "insufficient_data": False,
-        "completeness":    round(float(completeness), 2),
-        "data_quality":    quality,
-        "top_signals":     top_signals,
+        "completeness":      round(float(completeness), 2),
+        "data_quality":      quality,
+        "top_signals":       top_signals,
     }
 
 
 # ─── Full patient scorer ──────────────────────────────────────────────────────
 
-CONDITIONS = ['afib', 'parkinsons', 'sleep_apnea', 'heart_failure', 'infection', 'frailty']
+# All 14 conditions trained in v2
+CONDITIONS = [
+    'afib', 'parkinsons', 'sleep_apnea', 'heart_failure',
+    'infection', 'frailty', 'stress', 'depression',
+    'metabolic', 'fall_risk', 'hypertension', 'copd',
+    'thyroid', 'anemia',
+]
 
 def score_all(rows: list) -> dict:
     """
-    Score all 6 conditions from daily summary rows.
+    Score all 14 conditions from daily summary rows.
     Returns dict ready to store in ml_scores table or return via API.
     """
     if not rows:
         return {"scored_at": datetime.now().isoformat(), "scores": [], "health_index": 100}
 
     scores = [score_condition(cid, rows) for cid in CONDITIONS]
+
     # Overall health index: 100 − weighted mean of valid scores
     valid = [s for s in scores if not s['insufficient_data']]
     if valid:
@@ -185,9 +192,9 @@ def score_all(rows: list) -> dict:
         health_index = 100
 
     return {
-        "scored_at":     datetime.now().isoformat(),
-        "health_index":  health_index,
-        "scores":        scores,
+        "scored_at":    datetime.now().isoformat(),
+        "health_index": health_index,
+        "scores":       scores,
     }
 
 
@@ -215,7 +222,6 @@ def save_scores_to_db(db_path: str, result: dict):
     """
     conn = sqlite3.connect(db_path)
 
-    # ✅ single source of truth schema
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ml_scores (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -266,6 +272,7 @@ def save_scores_to_db(db_path: str, result: dict):
 
     conn.commit()
     conn.close()
+
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
