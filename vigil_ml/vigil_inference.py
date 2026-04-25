@@ -37,9 +37,9 @@ import joblib
 
 # ── Feature extraction: prefer v2 (14 conditions), fall back to v1 ────────────
 try:
-    import vigil_ml.vigil_features_v2 as vf
+    import vigil_features_v2 as vf
 except ImportError:
-    import vigil_ml.vigil_features as vf
+    import vigil_features as vf
 
 
 # ─── Model registry ───────────────────────────────────────────────────────────
