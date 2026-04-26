@@ -38,8 +38,34 @@ import joblib
 # ── Feature extraction: prefer v2 (14 conditions), fall back to v1 ────────────
 try:
     import vigil_features_v2 as vf
+    _VF_VERSION = 2
 except ImportError:
     import vigil_features as vf
+    _VF_VERSION = 1
+
+
+def _extract(condition_id: str, rows: list):
+    """
+    Compatibility wrapper around vf.extract().
+
+    v1 returns: (feat_array, feat_names, completeness)
+    v2 returns: just a numpy array (no names or completeness)
+
+    Always returns: (feat_array, feat_names, completeness)
+    """
+    result = vf.extract(condition_id, rows)
+
+    # v1: tuple of 3
+    if isinstance(result, tuple) and len(result) == 3:
+        feat, feat_names, completeness = result
+        return np.array(feat).flatten(), feat_names, float(completeness)
+
+    # v2: bare numpy array
+    feat = np.array(result).flatten()
+    # Estimate completeness from how many features are non-zero/non-nan
+    valid = np.sum(~np.isnan(feat) & (feat != 0))
+    completeness = float(valid) / len(feat) if len(feat) > 0 else 0.0
+    return feat, [], completeness
 
 
 # ─── Hardcoded metadata for all 14 conditions ─────────────────────────────────
@@ -214,7 +240,7 @@ def score_condition(condition_id: str, rows: list) -> dict:
 
     # ── Feature extraction ───────────────────────────────────────────────
     try:
-        feat, feat_names, completeness = vf.extract(condition_id, rows)
+        feat, feat_names, completeness = _extract(condition_id, rows)
     except Exception as e:
         return {**base,
                 "probability": 0.0, "score_0_100": 0.0, "level": "low",
@@ -249,9 +275,9 @@ def score_condition(condition_id: str, rows: list) -> dict:
 
     # ── Top contributing signals (SHAP-lite: feature × magnitude) ────────
     top_signals = []
-    if meta and meta.get('feature_names') and len(feat) == len(meta['feature_names']):
+    if feat_names and len(feat) == len(feat_names):
         deviations = [(name, float(abs(feat[i])))
-                      for i, name in enumerate(meta['feature_names'])
+                      for i, name in enumerate(feat_names)
                       if name != 'completeness_flag']
         deviations.sort(key=lambda x: -x[1])
         top_signals = [f"{name}: {val:.2f}" for name, val in deviations[:4]]
